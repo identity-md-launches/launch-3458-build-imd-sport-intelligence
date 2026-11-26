@@ -33,6 +33,9 @@ export async function openIntent(store: Store, cfg: OperatorConfig, reader: Chai
   if (blockers.length) return { ok: false, error: "checkout_unavailable", blockers };
   const existing = Object.values(store.db.intents).find((i) => lc(i.payer) === lc(payer) && i.predictionVersion === predictionVersion && (i.status === "partial" || (i.status === "open" && i.expiresAt > now)));
   const intent = existing ?? store.tx((db) => {
+    // Re-check inside the shared transaction: another operator process may have opened it meanwhile.
+    const again = Object.values(db.intents).find((i) => lc(i.payer) === lc(payer) && i.predictionVersion === predictionVersion && (i.status === "partial" || (i.status === "open" && i.expiresAt > now)));
+    if (again) return again;
     const it: Intent = {
       id: randomUUID(), payer: lc(payer), predictionVersion, token: lc(IMD_TOKEN.address), chainId: cfg.chainId,
       createdBlock: 0, expiresAt: now + cfg.intentTtlSeconds * 1000, createdAt: now, status: "open",
@@ -40,7 +43,7 @@ export async function openIntent(store: Store, cfg: OperatorConfig, reader: Chai
     };
     db.intents[it.id] = it; return it;
   });
-  if (!existing) { const b = await reader.blockNumber(); store.tx(() => { intent.createdBlock = b; }); }
+  if (!existing) { const b = await reader.blockNumber(); store.tx((db) => { if (db.intents[intent.id]) db.intents[intent.id].createdBlock = b; intent.createdBlock = b; }); }
   const calls = (["developer", "research"] as const).filter((k) => !intent.legs[k].txHash).map((k) => ({ leg: k, to: IMD_TOKEN.address, data: transferCalldata(intent.legs[k].recipient) }));
   return { ok: true, alreadyEntitled: false, intent, calls };
 }
@@ -56,7 +59,7 @@ export async function submitLeg(store: Store, cfg: OperatorConfig, reader: Chain
   if (!intent || lc(intent.payer) !== lc(sessionAddress)) return { ok: false, error: "intent_not_found", verified: [] };
   if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) return { ok: false, error: "bad_tx_hash", verified: [] };
   const hasLeg = !!(intent.legs.developer.verifiedAt || intent.legs.research.verifiedAt);
-  if (!hasLeg && intent.expiresAt < now) { store.tx(() => { intent.status = "expired"; }); return { ok: false, error: "intent_expired", verified: [] }; }
+  if (!hasLeg && intent.expiresAt < now) { store.tx((db) => { if (db.intents[intentId]) db.intents[intentId].status = "expired"; }); return { ok: false, error: "intent_expired", verified: [] }; }
   if ((await reader.chainId()) !== intent.chainId) return { ok: false, error: "wrong_chain", verified: [] };
   const rc = await reader.receipt(txHash);
   if (!rc) return { ok: false, error: "receipt_not_found", verified: [], pending: true };
@@ -73,7 +76,9 @@ export async function submitLeg(store: Store, cfg: OperatorConfig, reader: Chain
   if (!canonical || lc(canonical) !== lc(rc.blockHash ?? "")) return { ok: false, error: "receipt_not_canonical", verified: [], pending: true };
   const verified: string[] = [];
   let sawReserved = false;
+  let cur: Intent = intent;
   store.tx((db) => {
+    const intent = (cur = db.intents[intentId] ?? cur);
     for (const log of rc.logs as Log[]) {
       if (log.removed || lc(log.address) !== intent.token || lc(log.topics[0] ?? "") !== TRANSFER_TOPIC || log.topics.length !== 3) continue;
       const key = `${intent.chainId}:${lc(txHash)}:${Number(log.logIndex)}`;
@@ -95,8 +100,8 @@ export async function submitLeg(store: Store, cfg: OperatorConfig, reader: Chain
       db.ledger.push({ kind: "allocation", amountUnits: LEG_UNITS.toString(), ref: `research-leg:${intentId}`, at: now });
     }
   });
-  if (!verified.length) return { ok: false, error: sawReserved ? "duplicate_receipt" : "no_matching_transfer", verified, intent };
-  return { ok: true, verified, intent, entitled: intent.status === "paid" };
+  if (!verified.length) return { ok: false, error: sawReserved ? "duplicate_receipt" : "no_matching_transfer", verified, intent: cur };
+  return { ok: true, verified, intent: cur, entitled: cur.status === "paid" };
 }
 
 export function isEntitled(store: Store, address: string | null, version: string): boolean {

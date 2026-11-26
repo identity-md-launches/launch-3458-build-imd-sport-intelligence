@@ -23,6 +23,7 @@ const base = `http://127.0.0.1:${srv.address().port}${PREFIX}`;
 const EVENT = "openfootball:en.1:2025-26:2026-05-24:manchester-city-v-aston-villa";
 const V = `${EVENT}@imd-sport-synth-1@2026-05-24T14:00:00Z`;
 const A = "0x" + "a1".repeat(20), B = "0x" + "b2".repeat(20), DEV = "0x" + "d1".repeat(20), RES = "0x" + "e2".repeat(20);
+const FEED_EV = "api-sports:football:77";
 const H1 = "0x" + "01".repeat(32), H2 = "0x" + "02".repeat(32);
 
 const results = []; let failed = 0;
@@ -41,13 +42,17 @@ function companion() {
     if (path.startsWith("/api/feeds/")) return [200, { sport: path.slice(11), status: "unavailable", reason: "upstream 403 from api.sportradar.com (endpoint not licensed for this key)", observedUtc: now, events: [], availability: { status: "unavailable", reason: "not licensed", reports: [], sources: [] } }];
     if (path === "/api/siwe/nonce") return [200, { nonce: "fixturenonce123", domain: "127.0.0.1", chainId: 1 }];
     if (path === "/api/siwe/verify") { const addr = /0x[0-9a-fA-F]{40}/.exec(body.message)[0].toLowerCase(); const t = "tok-" + addr; st.sessions[t] = addr; return [200, { ok: true, token: t }]; }
-    if (path === `/api/events/${encodeURIComponent(EVENT)}/predictions`) return [200, { eventId: EVENT, signedIn: !!me, checkout: { enabled: true, blockers: [] }, versions: [{ version: V, modelVersion: "imd-sport-synth-1", baseModel: "epl-elo-olog-1", cutoffUtc: "2026-05-24T14:00:00Z", outcomes: ["home", "draw", "away"], releasedAt: 1, purchasable: true, entitled: !!me && st.entitled.has(me), intent: me && !st.entitled.has(me) && (st.legs.developer || st.legs.research) ? { id: "intent-1", status: "partial" } : null }] }];
+    if (path === `/api/events/${encodeURIComponent(EVENT)}/predictions`) return [200, { eventId: EVENT, signedIn: !!me, checkout: { enabled: true, blockers: [] }, versions: [{ version: V, modelVersion: "imd-sport-synth-1", baseModel: "epl-elo-olog-1", cutoffUtc: "2026-05-24T14:00:00Z", outcomes: ["home", "draw", "away"], releasedAt: 1, purchasable: true, entitled: !!me && st.entitled.has(me), intent: me && !st.entitled.has(me) && (st.legs.developer || st.legs.research || st.intentOpened) ? { id: "intent-1", status: st.legs.developer || st.legs.research ? "partial" : "open" } : null }] }];
+    if (path === "/api/feeds/football" && st.footballFeed) return [200, { sport: "football", status: "ok", observedUtc: now, events: [{ id: FEED_EV, sport: "football", competition: "English Premier League", startUtc: "2026-11-29T15:00:00.000Z", home: "Fixture Home", away: "Fixture Away", status: "scheduled", score: null, decidedIn: null, outcomeModel: "three-way", observedUtc: now, sources: ["https://v3.football.api-sports.io/fixtures?league=39"], freshnessSeconds: 0, corroboratedBy: [], availability: [] }], availability: { status: "ok", sources: [], reports: [] } }];
+    if (path === `/api/events/${encodeURIComponent(FEED_EV)}/predictions`) return [200, { eventId: FEED_EV, signedIn: !!me, checkout: { enabled: true, blockers: [] }, versions: [{ version: `${FEED_EV}@imd-sport-synth-1@2026-11-29T14:00:00Z`, modelVersion: "imd-sport-synth-1", baseModel: "epl-elo-olog-1", cutoffUtc: "2026-11-29T14:00:00Z", outcomes: ["home", "draw", "away"], releasedAt: 2, purchasable: true, entitled: false, intent: null }] }];
+    if (path.startsWith("/api/events/")) return [200, { eventId: decodeURIComponent(path.slice(12, -12)), signedIn: !!me, checkout: { enabled: true, blockers: [] }, versions: [] }];
     if (path.startsWith("/api/predictions/")) { const v = decodeURIComponent(path.slice(17)); if (v !== V) return [404, { error: "unknown_prediction" }]; if (!me || !st.entitled.has(me)) return [402, { error: "not_entitled" }];
-      return [200, { release: { version: V, cutoffUtc: "2026-05-24T14:00:00Z", outcomes: ["home", "draw", "away"], probabilities: [0.62, 0.21, 0.17], confidence: "medium", reasons: ["Fixture reason: home side rested"], counterarguments: ["Fixture counter: away form"], dataGaps: ["weather: challenge not accepted"], calibration: { temperature: 1.08, n: 380 }, evidence: [1, 2, 3] } }]; }
+      return [200, { eventId: EVENT, release: { eventId: EVENT, version: V, cutoffUtc: "2026-05-24T14:00:00Z", outcomes: ["home", "draw", "away"], probabilities: [0.62, 0.21, 0.17], confidence: "medium", reasons: ["Fixture reason: home side rested"], counterarguments: ["Fixture counter: away form"], dataGaps: ["weather: challenge not accepted"], calibration: { temperature: 1.08, n: 380 }, evidence: [1, 2, 3] } }]; }
     if (!me) return [401, { error: "sign_in_required" }];
     if (path === "/api/intents") {
       if (body.predictionVersion !== V) return [409, { ok: false, error: "checkout_unavailable", blockers: ["prediction version is not a purchasable completed prediction"] }];
       if (st.entitled.has(me)) return [200, { ok: true, alreadyEntitled: true }];
+      st.intentOpened = true;
       const legs = { developer: { recipient: DEV, ...(st.legs.developer ? { txHash: st.legs.developer, verifiedAt: 1 } : {}) }, research: { recipient: RES, ...(st.legs.research ? { txHash: st.legs.research, verifiedAt: 1 } : {}) } };
       const calls = ["developer", "research"].filter((k) => !st.legs[k]).map((k) => ({ leg: k, to: "0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7", data: "0xa9059cbb" }));
       return [200, { ok: true, alreadyEntitled: false, intent: { id: "intent-1", legs }, calls }];
@@ -78,7 +83,9 @@ const WALLET = ({ A }) => {
       if (method === "eth_accounts") return localStorage.getItem("__fixture_authorized") ? [w.account] : [];
       if (method === "eth_chainId") { w.chainChecks++; return w.chain; }
       if (method === "personal_sign") return "0x" + "11".repeat(65);
-      if (method === "wallet_getCapabilities") throw Object.assign(new Error("unsupported"), { code: 4200 });
+      if (method === "wallet_getCapabilities") { if (localStorage.getItem("__fixture_atomic")) return { "0x1": { atomic: { status: "supported" } } }; throw Object.assign(new Error("unsupported"), { code: 4200 }); }
+      if (method === "wallet_sendCalls") { const n = Number(localStorage.getItem("__fixture_sendcalls") ?? 0) + 1; localStorage.setItem("__fixture_sendcalls", String(n)); return { id: `batch-${n}` }; }
+      if (method === "wallet_getCallsStatus") { const log = JSON.parse(localStorage.getItem("__fixture_polls") ?? "[]"); log.push(params[0]); localStorage.setItem("__fixture_polls", JSON.stringify(log)); return { status: 100, receipts: [] }; }
       if (method === "wallet_switchEthereumChain") { w.chain = params[0].chainId; emit("chainChanged", w.chain); return null; }
       if (method === "eth_sendTransaction") { w.sends.push({ chain: w.chain, params }); const next = w.plan.shift(); if (!next || next === "reject") throw Object.assign(new Error("User rejected the request."), { code: 4001 }); return next; }
       if (method === "wallet_revokePermissions" || method === "wallet_requestPermissions") return [];
@@ -122,7 +129,7 @@ const connect = async (page) => {
   const { page, co, errors } = await newPage();
   await page.goto(base + "#/sport/nhl/live"); await page.locator(".feed li").first().waitFor();
   check("nhl live requests /api/feeds/nhl", co.st.log.filter((l) => l.path === "/api/feeds/nhl").length >= 1);
-  check("nhl live renders the returned event with score, source and freshness", (await page.locator(".feed li").count()) === 1 && /Harbour Pike\s*2–1\s*Ridge Owls/.test(await page.locator(".feed li").innerText()) && (await page.locator(".feed li").innerText()).includes("12 s old"));
+  check("nhl live renders the returned event with score, source and freshness", (await page.locator(".feed li").count()) === 1 && /Harbour Pike\s*2–1\s*Ridge Owls/.test(await page.locator(".feed li").innerText()) && /\d+ s old/.test(await page.locator(".feed li").innerText()));
   check("nhl header no longer claims no feed", !(await page.locator(".sport-head").innerText()).includes("No licensed live feed"));
   await page.getByRole("tab", { name: "Injuries and availability" }).click(); await page.locator("table.tbl").waitFor();
   check("nhl availability renders a withdrawal, not an injury", (await page.locator("table.tbl").innerText()).includes("Withdrawal, no injury reported"));
@@ -203,6 +210,74 @@ const connect = async (page) => {
   await page.keyboard.press("Escape");
   await page.waitForTimeout(50);
   check("Escape returns focus to Connect", (await page.evaluate(() => document.activeElement?.textContent)) === "Connect");
+  await page.close();
+}
+
+// R1. An open live view refreshes and ages: after 180 s with no newer observation the row reads Stale.
+{
+  const { page, co, errors } = await newPage();
+  await page.clock.install({ time: Date.now() });
+  await page.goto(base + "#/sport/nhl/live"); await page.locator(".feed li").first().waitFor();
+  await page.clock.fastForward(180_000); await page.waitForTimeout(200);
+  const txt = await page.locator(".feed li").innerText();
+  check("live view re-requests its feed while open", co.st.log.filter((l) => l.path === "/api/feeds/nhl").length >= 2, String(co.st.log.filter((l) => l.path === "/api/feeds/nhl").length));
+  check("a live row past 120 s with no fresh observation shows Stale and its increased age", /Stale/.test(txt) && /\d+ min old/.test(txt), txt.replace(/\s+/g, " ").slice(0, 120));
+  check("no page errors (refresh)", errors.length === 0, errors.join(" | "));
+  await page.close();
+}
+
+// R2. A pending atomic batch survives a reload: same batch polled, no second batch, no Pay button.
+{
+  const { page, errors } = await newPage();
+  await page.goto(base + `#/match/${encodeURIComponent(EVENT)}`);
+  await page.evaluate(() => localStorage.setItem("__fixture_atomic", "1"));
+  await connect(page);
+  await page.getByRole("button", { name: "Review the purchase" }).click();
+  await page.getByRole("button", { name: "Pay 1 IMD" }).click();
+  await page.waitForFunction(() => JSON.parse(localStorage.getItem("__fixture_polls") ?? "[]").length >= 1);
+  check("batch id persisted as soon as wallet_sendCalls returns", JSON.parse(await page.evaluate(() => localStorage.getItem("imd-sport-batch:intent-1")) ?? "{}").id === "batch-1");
+  await page.reload();
+  await page.getByRole("button", { name: "Check the sent transfer again" }).waitFor({ timeout: 10000 });
+  check("after reload the pending batch holds both legs: no Pay button", (await page.getByRole("button", { name: /^Pay / }).count()) === 0);
+  await page.getByRole("button", { name: "Check the sent transfer again" }).click(); await page.waitForTimeout(300);
+  const polls = JSON.parse(await page.evaluate(() => localStorage.getItem("__fixture_polls")));
+  check("only batch-1 is polled and wallet_sendCalls ran once", polls.every((x) => x === "batch-1") && (await page.evaluate(() => localStorage.getItem("__fixture_sendcalls"))) === "1", polls.join(","));
+  check("no page errors (batch)", errors.length === 0, errors.join(" | "));
+  await page.close();
+}
+
+// R3. Changing the hash to another event drops the previous event's owned synthesis.
+{
+  const { page, co, errors } = await newPage();
+  co.st.entitled.add(A.toLowerCase());
+  await page.goto(base + `#/match/${encodeURIComponent(EVENT)}`); await connect(page);
+  await page.getByRole("button", { name: "Review the purchase" }).click();
+  await page.getByText("Fixture reason: home side rested").waitFor();
+  await page.evaluate(() => { location.hash = "#/match/" + encodeURIComponent("openfootball:en.1:2025-26:2025-08-15:liverpool-v-afc-bournemouth"); });
+  await page.getByRole("heading", { name: /Liverpool/ }).waitFor(); await page.waitForTimeout(400);
+  const main = await page.locator("main").innerText();
+  check("the new event shows no premium reason and no ownership notice", !main.includes("Fixture reason") && !main.includes("You own this prediction version"));
+  check("the new event's versions were requested", co.st.log.some((l) => l.path.includes("liverpool-v-afc-bournemouth")));
+  check("no page errors (event change)", errors.length === 0, errors.join(" | "));
+  await page.close();
+}
+
+// R4. Licensed-feed events open by their stable ID and list their released versions.
+{
+  const { page, co, errors } = await newPage();
+  co.st.footballFeed = true;
+  await page.goto(base + "#/sport/football/upcoming"); await page.locator(".feed li").first().waitFor();
+  check("football upcoming links the feed fixture", (await page.locator(`.feed a[href*="${encodeURIComponent(FEED_EV)}"]`).count()) === 1);
+  await page.getByRole("tab", { name: "Prediction previews" }).click();
+  await page.getByRole("heading", { name: "Fixture Home v Fixture Away" }).waitFor();
+  check("previews list the feed fixture with its released version", co.st.log.some((l) => l.path === `/api/events/${encodeURIComponent(FEED_EV)}/predictions`));
+  await page.goto(base + `#/match/${encodeURIComponent(FEED_EV)}`); await page.getByRole("heading", { name: /Fixture Home/ }).waitFor();
+  const main = await page.locator("main").innerText();
+  check("direct feed route renders the feed event, not the archive match", !main.includes("Manchester City") && main.includes("Fixture Away"));
+  check("feed match requests its own versions", co.st.log.filter((l) => l.path === `/api/events/${encodeURIComponent(FEED_EV)}/predictions`).length >= 2);
+  await page.goto(base + "#/sport/nhl/previews"); await page.getByText(/No validated preview for the 1 current event/).waitFor();
+  check("a sport with feed events but no version shows an explicit unavailable preview state", true);
+  check("no page errors (feed events)", errors.length === 0, errors.join(" | "));
   await page.close();
 }
 

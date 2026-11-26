@@ -97,9 +97,45 @@ export type LegReply = { ok: boolean; verified: string[]; entitled?: boolean; er
 const PENDING_ERRORS = new Set(["receipt_not_found", "not_final", "receipt_not_canonical"]);
 export const postLeg = (intentId: string, txHash: string) => api<LegReply>(`/api/intents/${intentId}/legs`, { method: "POST", body: JSON.stringify({ txHash }) });
 
-/** Re-verify every persisted hash before anything new is requested. Returns legs still waiting on finality. */
+/**
+ * Wallet batches (EIP-5792) sent but not yet landed, kept per intent from the moment
+ * wallet_sendCalls returns, so a reload resumes polling the same batch and never sends a second.
+ */
+const BKEY = (intentId: string) => `imd-sport-batch:${intentId}`;
+export type PendingBatch = { id: string; legs: string[]; sentAt: number };
+export const pendingBatch = {
+  get: (intentId: string): PendingBatch | null => { try { return JSON.parse(localStorage.getItem(BKEY(intentId)) ?? "null"); } catch { return null; } },
+  set: (intentId: string, b: PendingBatch) => localStorage.setItem(BKEY(intentId), JSON.stringify(b)),
+  drop: (intentId: string) => localStorage.removeItem(BKEY(intentId)),
+};
+/** EIP-5792 status: 1xx pending, 200 confirmed, 4xx/5xx failed (older wallets answer strings). */
+const batchState = (st: any): "pending" | "confirmed" | "failed" => {
+  const c = st?.status;
+  if (c === 200 || c === "CONFIRMED" || c === "confirmed") return "confirmed";
+  if ((typeof c === "number" && c >= 400) || c === "FAILED" || c === "failed") return "failed";
+  return "pending";
+};
+/**
+ * Ask the wallet once about the intent's pending batch. Confirmed receipts move to the hash list
+ * for verification against the same intent; a failed batch frees its legs; otherwise they stay held.
+ */
+export async function checkBatch(intentId: string, p?: Eip1193 | null): Promise<"none" | "pending" | "landed" | "failed"> {
+  const b = pendingBatch.get(intentId); if (!b) return "none";
+  p ??= await provider().catch(() => null);
+  if (!p) return "pending";
+  let st: any; try { st = await p.request({ method: "wallet_getCallsStatus", params: [b.id] }); } catch { return "pending"; }
+  const hashes: string[] = [...new Set<string>((st?.receipts ?? []).map((r: { transactionHash: string }) => r.transactionHash).filter(Boolean))];
+  const state = batchState(st);
+  if (hashes.length && state !== "failed") { hashes.forEach((h) => pendingHashes.set(intentId, b.legs, h)); pendingBatch.drop(intentId); return "landed"; }
+  if (state === "failed") { pendingBatch.drop(intentId); return "failed"; }
+  return "pending";
+}
+
+/** Re-verify every persisted hash and batch before anything new is requested. Returns legs still waiting. */
 export async function reconcilePending(intentId: string): Promise<{ entitled: boolean; waiting: string[]; errors: string[] }> {
   let entitled = false; const errors: string[] = [];
+  const batch = await checkBatch(intentId);
+  if (batch === "failed") errors.push("The wallet reports the batch failed; nothing was charged by it. You can pay again.");
   const byHash = new Map<string, string[]>();
   for (const [leg, h] of Object.entries(pendingHashes.get(intentId))) byHash.set(h, [...(byHash.get(h) ?? []), leg]);
   for (const [h, legs] of byHash) {
@@ -108,7 +144,8 @@ export async function reconcilePending(intentId: string): Promise<{ entitled: bo
     else if (r.status === 0 || PENDING_ERRORS.has(r.data?.error ?? "") || r.data?.pending) continue; // keep waiting; never re-request this leg
     else { pendingHashes.drop(intentId, legs); errors.push(`${legs.join(" and ")} transfer: ${r.data?.error ?? "refused"}`); }
   }
-  return { entitled, waiting: Object.keys(pendingHashes.get(intentId)), errors };
+  const held = pendingBatch.get(intentId)?.legs ?? [];
+  return { entitled, waiting: [...new Set([...Object.keys(pendingHashes.get(intentId)), ...held])], errors };
 }
 
 async function ensureMainnet(p: Eip1193) {
@@ -126,17 +163,23 @@ export async function payLegs(intentId: string, from: string, calls: { to: strin
   await ensureMainnet(p);
   let atomic = false;
   try { const caps = await p.request({ method: "wallet_getCapabilities", params: [from, ["0x1"]] }); const c = caps?.["0x1"] ?? caps?.[1]; atomic = c?.atomic?.status === "supported" || c?.atomic?.status === "ready" || c?.atomicBatch?.supported === true; } catch { atomic = false; }
+  if (pendingBatch.get(intentId)) throw new Error("A wallet batch for this purchase is still pending. Check it again instead of paying.");
   if (atomic && calls.length > 1) {
     onStep("Confirm one batch in your wallet");
     await ensureMainnet(p);
-    const { id } = await p.request({ method: "wallet_sendCalls", params: [{ version: "2.0.0", chainId: "0x1", from, atomicRequired: true, calls: calls.map((c) => ({ to: c.to, data: c.data, value: "0x0" })) }] });
-    for (let i = 0; i < 120; i++) {
-      const s = await p.request({ method: "wallet_getCallsStatus", params: [id] });
-      const hashes: string[] = [...new Set<string>((s?.receipts ?? []).map((r: { transactionHash: string }) => r.transactionHash))];
-      if (hashes.length) { hashes.forEach((h) => pendingHashes.set(intentId, calls.map((c) => c.leg), h)); onStep("Sent. Waiting for Ethereum finality, then verifying"); return; }
-      await new Promise((r) => setTimeout(r, 3000));
+    const r = await p.request({ method: "wallet_sendCalls", params: [{ version: "2.0.0", chainId: "0x1", from, atomicRequired: true, calls: calls.map((c) => ({ to: c.to, data: c.data, value: "0x0" })) }] });
+    const id = typeof r === "string" ? r : r?.id;
+    if (!id) throw new Error("The wallet did not return a batch id.");
+    // Persist before polling: a reload from here on resumes this batch instead of sending another.
+    pendingBatch.set(intentId, { id, legs: calls.map((c) => c.leg), sentAt: Date.now() });
+    onStep("Batch sent. Waiting for the wallet to report its transaction");
+    for (let i = 0; i < 40; i++) {
+      const s = await checkBatch(intentId, p);
+      if (s === "landed") { onStep("Sent. Waiting for Ethereum finality, then verifying"); return; }
+      if (s === "failed") throw new Error("The wallet reports the batch failed. Nothing was charged by it.");
+      await new Promise((res) => setTimeout(res, 3000));
     }
-    throw new Error("The batch has not landed yet. Reopen this prediction to resume.");
+    return; // still pending: its legs stay held, and reopening this prediction checks the same batch
   }
   for (const [i, c] of calls.entries()) {
     onStep(`Confirm transfer ${i + 1} of ${calls.length} in your wallet (${c.leg === "developer" ? "developer" : "Swarm research"} leg)`);

@@ -4,7 +4,7 @@ import epl from "./data/epl.json";
 import { Logo, SportArt } from "./art";
 import { ConnectSheet, signIn, payLegs, reconcilePending, pendingHashes, short } from "./wallet";
 import { COMPANION_ORIGIN, WALLETCONNECT_PROJECT_ID, TOKEN } from "./release";
-import { api, getStatus, session, type Status, type FeedResponse, type FeedEvent, type FeedAvailability } from "./companion";
+import { api, getStatus, session, liveState, FEED_REFRESH_MS, type Status, type FeedResponse, type FeedEvent, type FeedAvailability } from "./companion";
 
 type M = { id: string; season: string; round: string; kickoffUtc: string; home: string; away: string; p: number[]; result: "H" | "D" | "A" | null; ft: number[] | null; eloHome: number; eloAway: number };
 const HELD = epl.heldOut as M[];
@@ -42,14 +42,31 @@ function useStatus() {
   return { status: s, tried };
 }
 
-/** Feed data for one sport from the companion's /api/feeds/:sport, requested when the view opens. */
+/** A clock for derived ages; ticks while a view is open. */
+function useNow(ms = 5000) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), ms); return () => clearInterval(t); }, [ms]);
+  return now;
+}
+type FeedState = { state: "off" | "loading" | "ok" | "unavailable"; data?: FeedResponse; reason?: string; retryFailedAt?: number };
+/**
+ * Feed data for one sport from the companion's /api/feeds/:sport. Requested when the view opens and
+ * again every FEED_REFRESH_MS while it stays open. A failed refresh keeps the last observation on
+ * screen, dated, and its rows age into Stale (liveState) until a fresh observation arrives.
+ */
 function useFeed(sport: string) {
-  const [st, setSt] = useState<{ state: "off" | "loading" | "ok" | "unavailable"; data?: FeedResponse; reason?: string }>({ state: COMPANION_ORIGIN ? "loading" : "off" });
+  const [st, setSt] = useState<FeedState>({ state: COMPANION_ORIGIN ? "loading" : "off" });
   useEffect(() => {
     if (!COMPANION_ORIGIN) return;
     let live = true; setSt({ state: "loading" });
-    api<FeedResponse>(`/api/feeds/${sport}`).then((r) => { if (!live) return; if (r.ok && r.data.status === "ok") setSt({ state: "ok", data: r.data }); else setSt({ state: "unavailable", data: r.ok ? r.data : undefined, reason: r.ok ? r.data.reason : "the companion service did not answer" }); });
-    return () => { live = false; };
+    const load = () => api<FeedResponse>(`/api/feeds/${sport}`).then((r) => {
+      if (!live) return;
+      if (r.ok && r.data.status === "ok") setSt({ state: "ok", data: r.data });
+      else setSt((prev) => prev.state === "ok" && prev.data ? { ...prev, retryFailedAt: Date.now() } : { state: "unavailable", data: r.ok ? r.data : undefined, reason: r.ok ? r.data.reason : "the companion service did not answer" });
+    });
+    load();
+    const t = setInterval(load, FEED_REFRESH_MS);
+    return () => { live = false; clearInterval(t); };
   }, [sport]);
   return st;
 }
@@ -73,7 +90,7 @@ export function App() {
   useEffect(() => { const t = document.querySelector("main h1")?.textContent; if (t) document.title = `${t} · IMD Sport Intelligence`; }, [route]);
   let page;
   if (parts[0] === "sport") page = <SportView id={parts[1] ?? "football"} tab={parts[2] ?? "live"} />;
-  else if (parts[0] === "match") page = <MatchPage id={decodeURIComponent(parts.slice(1).join("/"))} />;
+  else if (parts[0] === "match") { const [path, q] = parts.slice(1).join("/").split("?"); page = <MatchPage id={decodeURIComponent(path)} sport={new URLSearchParams(q ?? "").get("sport") ?? undefined} />; }
   else if (parts[0] === "accuracy") page = <Accuracy />;
   else if (parts[0] === "account") page = <Account />;
   else if (parts[0] === "activation") page = <Activation />;
@@ -212,13 +229,13 @@ function SportView({ id, tab }: { id: string; tab: string }) {
         {tabs.map(([k, l]) => <a key={k} role="tab" aria-selected={tab === k} href={`#/sport/${s.id}/${k}`}>{l}</a>)}
       </div>
       <section className="panel" role="tabpanel">
-        {tab === "live" && (ok ? <FeedList title="Live and recent" rows={ev.filter((e) => e.status !== "scheduled")} empty="No live or recent events in the feed window." /> : (
+        {tab === "live" && (ok ? <FeedList title="Live and recent" sport={s.id} feed={feed} rows={ev.filter((e) => e.status !== "scheduled")} empty="No live or recent events in the feed window." /> : (
           <>
             <Unavailable what="Live scores" sport={s} feed={feed} />
             {isFb && <><h2>Latest results in the snapshot</h2><p className="muted small">Final scores recorded in the archive as of {asOf}. These are historical, not live.</p><FixtureList rows={finals} /></>}
           </>
         ))}
-        {tab === "upcoming" && (ok ? <FeedList title="Upcoming" rows={ev.filter((e) => e.status === "scheduled")} empty="No scheduled events in the feed window." /> : isFb ? (
+        {tab === "upcoming" && (ok ? <FeedList title="Upcoming" sport={s.id} feed={feed} rows={ev.filter((e) => e.status === "scheduled")} empty="No scheduled events in the feed window." /> : isFb ? (
           <>
             {feed.state !== "off" && <Unavailable what="Upcoming events" sport={s} feed={feed} />}
             <h2>Scheduled in the {SNAP_MONTH} snapshot</h2>
@@ -233,10 +250,82 @@ function SportView({ id, tab }: { id: string; tab: string }) {
             <p className="muted small">When active, each report states its kind: a confirmed injury, a withdrawal with no injury reported, an absence with no reason given, a suspension or a questionable status, each with its source and observation time.</p>
           </>
         ))}
-        {tab === "previews" && (isFb ? <Previews rows={FUTURE.length ? FUTURE : PAST_NO_RESULT} /> : (
-          <div className="empty"><h2>No validated model for {s.name} yet</h2><p className="muted">The only completed backtest is the EPL pilot, and it supports EPL claims only. {s.name} previews will appear after a backtest of the same kind and after research is activated.</p><a className="btn btn-blue" href="#/accuracy">See the EPL backtest</a></div>
-        ))}
+        {tab === "previews" && (
+          <>
+            <FeedPreviews sport={s.id} name={s.name} feed={feed} />
+            {isFb ? <Previews rows={FUTURE.length ? FUTURE : PAST_NO_RESULT} /> : (
+              <div className="empty"><h2>No validated model for {s.name} yet</h2><p className="muted">The only completed backtest is the EPL pilot, and it supports EPL claims only. {s.name} previews will appear after a backtest of the same kind and after research is activated.</p><a className="btn btn-blue" href="#/accuracy">See the EPL backtest</a></div>
+            )}
+          </>
+        )}
         {tab === "research" && <Research sport={s.id} status={status} />}
+      </section>
+    </>
+  );
+}
+
+type VersionList = { versions: { version: string; cutoffUtc: string; purchasable: boolean; entitled: boolean }[]; checkout: { enabled: boolean; blockers: string[] } };
+/** Released prediction versions for the feed's current events, one request per event, by stable event ID. */
+function FeedPreviews({ sport, name, feed }: { sport: string; name: string; feed: FeedState }) {
+  const events = useMemo(() => (feed.data?.events ?? []).filter((e) => e.status === "scheduled" || e.status === "live").slice(0, 20), [feed.data]);
+  const [found, setFound] = useState<Record<string, VersionList["versions"]> | null>(null);
+  const ids = events.map((e) => e.id).join("|");
+  useEffect(() => {
+    if (!events.length) { setFound({}); return; }
+    let live = true; setFound(null);
+    Promise.all(events.map((e) => api<VersionList>(`/api/events/${encodeURIComponent(e.id)}/predictions`).then((r) => [e.id, r.ok ? r.data.versions : []] as const))).then((rows) => { if (live) setFound(Object.fromEntries(rows)); });
+    return () => { live = false; };
+  }, [ids]);
+  if (feed.state === "off") return null;
+  if (feed.state !== "ok") return <div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>Previews for current {name} events: unavailable</strong><p className="muted small">The licensed feed is not answering, so no current event can be matched to a released prediction version.</p></div></div>;
+  const withVersions = events.filter((e) => (found?.[e.id] ?? []).length);
+  return (
+    <>
+      <h2>Current {name} events</h2>
+      {!found ? <p className="muted">Checking released prediction versions…</p> : !withVersions.length ? (
+        <div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>No validated preview for the {events.length} current event{events.length === 1 ? "" : "s"}.</strong><p className="muted small">A preview appears here once the operator releases a version for the event from a validated model. No payment is requested.</p></div></div>
+      ) : (
+        <div className="previews">
+          {withVersions.map((e) => { const v = found![e.id]; const buy = v.some((x) => x.purchasable); return (
+            <article key={e.id} className="card">
+              <div className="meta"><Badge kind={e.status} /><span>{dt(e.startUtc)}</span></div>
+              <h3>{e.home} v {e.away}</h3>
+              <p className="muted small">{v.length} released version{v.length === 1 ? "" : "s"}, latest cutoff {dt(v[0].cutoffUtc)}. {buy ? "A completed version is available." : "Not yet complete; not for sale."}</p>
+              <a href={`#/match/${encodeURIComponent(e.id)}?sport=${sport}`}>Open the event</a>
+            </article>
+          ); })}
+        </div>
+      )}
+    </>
+  );
+}
+
+/** A licensed-feed event, opened by its stable ID. Never falls back to an archive match. */
+function FeedMatchPage({ id, sport }: { id: string; sport: string }) {
+  const feed = useFeed(sport);
+  const now = useNow();
+  const e = feed.data?.events.find((x) => x.id === id);
+  const meta = SPORTS.find((x) => x.id === sport);
+  if (!COMPANION_ORIGIN || feed.state === "off") return <><h1>Event {id}</h1><div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>Licensed feeds are off in this release.</strong><p className="muted small">This event comes from an operator feed, which needs the companion service. <a href="#/activation">What needs activation</a></p></div></div></>;
+  if (feed.state === "loading") return <><h1>Event {id}</h1><p className="muted">Asking the companion service…</p></>;
+  if (!e) return <><h1>Event {id}</h1><div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>This event is not in the current feed window.</strong><p className="muted small">{feed.state === "ok" ? "The feed answered without it; it may have moved or finished long ago." : `The companion reports: ${feed.reason ?? "no data"}.`} <a href={`#/sport/${sport}`}>Back to {meta?.name ?? sport}</a></p></div></div></>;
+  const ls = liveState(e, now); const res = RESULT_TEXT(e);
+  return (
+    <>
+      <div className="meta"><Badge kind={ls.status} /><span>{e.competition}</span>{e.decidedIn && <span>{DECIDED[e.decidedIn] ?? e.decidedIn}</span>}<span>{e.outcomeModel === "three-way" ? "Draw possible" : "Two-way"}</span></div>
+      <h1 className="fixture big-fix"><span>{e.home}</span><span className="score num">{e.score ? e.score.join("–") : "v"}</span><span>{e.away}</span></h1>
+      <p className="muted">Starts {dt(e.startUtc)}. Observed {dt(e.observedUtc)}, {age(ls.ageSeconds)}.{res ? ` ${res}.` : ""}</p>
+      <section className="card">
+        <h2>Prediction</h2>
+        <Checkout key={e.id} eventId={e.id} home={e.home} away={e.away} />
+      </section>
+      <section className="card">
+        <h2>Source</h2>
+        <dl className="facts">
+          <div><dt>Event ID</dt><dd className="mono wrap">{e.id}</dd></div>
+          <div><dt>Feed</dt><dd>{e.sources.map((u) => <a key={u} className="wrap" href={u}>{host(u)}</a>)}</dd></div>
+          <div><dt>Corroboration</dt><dd>{e.corroboratedBy.length ? e.corroboratedBy.map(host).join(", ") : "Single source"}</dd></div>
+        </dl>
       </section>
     </>
   );
@@ -255,21 +344,25 @@ function Unavailable({ what, sport, feed, reason }: { what: string; sport: (type
   );
 }
 
-function FeedList({ title, rows, empty }: { title: string; rows: FeedEvent[]; empty: string }) {
+const RESULT_TEXT = (e: FeedEvent) => !e.result ? null : e.result.outcome === "draw" ? `Draw${e.result.method ? `, ${e.result.method.replace(/_/g, " ")}` : ""}` : e.result.outcome === "no-contest" ? "No contest" : e.result.winner ? `${e.result.winner} won${e.result.method ? `, ${e.result.method.replace(/_/g, " ")}` : ""}` : null;
+function FeedList({ title, rows, empty, sport, feed }: { title: string; rows: FeedEvent[]; empty: string; sport: string; feed?: FeedState }) {
+  const now = useNow();
   return (
     <>
       <h2>{title}</h2>
+      {feed?.retryFailedAt && <p className="note" role="status">The last refresh failed at {dt(new Date(feed.retryFailedAt).toISOString())}. Showing the previous observation, dated below; retrying every {FEED_REFRESH_MS / 1000} s.</p>}
       {!rows.length ? <p className="muted">{empty}</p> : (
         <ul className="feed">
-          {rows.map((e) => (
+          {rows.map((e) => { const ls = liveState(e, now); const res = RESULT_TEXT(e); return (
             <li key={e.id}>
-              <div className="meta"><Badge kind={e.status} /><span>{e.competition}</span>{e.decidedIn && <span>{DECIDED[e.decidedIn] ?? e.decidedIn}</span>}<span>{e.outcomeModel === "three-way" ? "Draw possible" : "Two-way"}</span></div>
-              <span className="fx-teams">{e.home} <span className="num">{e.score ? e.score.join("–") : "v"}</span> {e.away}</span>
-              <span className="muted small">Starts {dt(e.startUtc)}. Observed {dt(e.observedUtc)}, {age(e.freshnessSeconds)}. {e.corroboratedBy.length ? `Corroborated by ${e.corroboratedBy.length} other source${e.corroboratedBy.length > 1 ? "s" : ""}.` : "Single source."}</span>
+              <div className="meta"><Badge kind={ls.status} /><span>{e.competition}</span>{e.decidedIn && <span>{DECIDED[e.decidedIn] ?? e.decidedIn}</span>}<span>{e.outcomeModel === "three-way" ? "Draw possible" : "Two-way"}</span></div>
+              <a className="fx-teams" href={`#/match/${encodeURIComponent(e.id)}?sport=${sport}`}>{e.home} <span className="num">{e.score ? e.score.join("–") : "v"}</span> {e.away}</a>
+              {res && <span className="small">{res}</span>}
+              <span className="muted small">Starts {dt(e.startUtc)}. Observed {dt(e.observedUtc)}, {age(ls.ageSeconds)}. {e.corroboratedBy.length ? `Corroborated by ${e.corroboratedBy.length} other source${e.corroboratedBy.length > 1 ? "s" : ""}.` : "Single source."}</span>
               <span className="small">Source: {e.sources.map((u) => <a key={u} href={u}>{host(u)}</a>)} · <span className="mono">{e.id}</span></span>
               {e.availability.length > 0 && <span className="small">{e.availability.map((a) => `${a.player}: ${KIND[a.kind]}`).join("; ")}</span>}
             </li>
-          ))}
+          ); })}
         </ul>
       )}
     </>
@@ -347,8 +440,14 @@ function Research({ sport, status }: { sport: string; status: Status | null }) {
   );
 }
 
-function MatchPage({ id }: { id: string }) {
-  const m = ALL.find((x) => x.id === id) ?? F;
+function MatchPage({ id, sport }: { id: string; sport?: string }) {
+  const arch = ALL.find((x) => x.id === id);
+  // Feed IDs carry their provider and sport (api-sports:football:77, sportradar:nhl:…); they never resolve to the archive.
+  const feedSport = sport ?? id.match(/^[a-z-]+:(mma|nhl|nfl|nba|football|tennis):/)?.[1];
+  if (!arch && feedSport) return <FeedMatchPage id={id} sport={feedSport} />;
+  return <ArchiveMatch m={arch ?? F} />;
+}
+function ArchiveMatch({ m }: { m: M }) {
   const snap = m.season === epl.snapshot.season;
   const st = snapshotStatus(m);
   const b = brierOf(m);
@@ -381,7 +480,7 @@ function MatchPage({ id }: { id: string }) {
       </section>
       <section className="card">
         <h2>Premium synthesis</h2>
-        <Checkout eventId={m.id} home={team(m.home)} away={team(m.away)} />
+        <Checkout key={m.id} eventId={m.id} home={team(m.home)} away={team(m.away)} />
       </section>
       <section className="card">
         <h2>Source</h2>
@@ -399,7 +498,7 @@ function MatchPage({ id }: { id: string }) {
 type Version = { version: string; modelVersion: string; baseModel: string; cutoffUtc: string; outcomes: string[]; releasedAt: number; purchasable: boolean; entitled: boolean; intent: { id: string; status: string } | null };
 type Intent = { id: string; legs: Record<"developer" | "research", { recipient: string; txHash?: string; verifiedAt?: number }> };
 type Call = { to: string; data: string; leg: string };
-type Synthesis = { release: { version: string; cutoffUtc: string; outcomes: string[]; probabilities: number[]; confidence: string; reasons: string[]; counterarguments: string[]; dataGaps: string[]; calibration: { temperature: number; n: number }; evidence: unknown[] } };
+type Synthesis = { eventId?: string; release: { eventId?: string; version: string; cutoffUtc: string; outcomes: string[]; probabilities: number[]; confidence: string; reasons: string[]; counterarguments: string[]; dataGaps: string[]; calibration: { temperature: number; n: number }; evidence: unknown[] } };
 const LEG_NAME = { developer: "Developer", research: "Swarm research" } as const;
 
 function SynthesisView({ s, home, away }: { s: Synthesis; home: string; away: string }) {
@@ -440,6 +539,9 @@ function Checkout({ eventId, home = "Home", away = "Away" }: { eventId: string; 
   };
   const openSynthesis = async (version: string) => {
     const r = await api<Synthesis>(`/api/predictions/${encodeURIComponent(version)}`);
+    // Render a synthesis only for this event's own version; anything else is dropped.
+    const mine = r.ok && r.data.release?.version === version && (r.data.eventId ?? r.data.release?.eventId) === eventId;
+    if (r.ok && !mine) { setErr("The companion returned a synthesis for a different event; it is not shown."); return; }
     if (r.ok) { setOwned(r.data); setActive(null); setStep(""); } else setErr(r.status === 402 ? "The companion has not granted this version yet." : "The companion did not return the synthesis.");
   };
   /** Ask the companion for the bound intent (idempotent) and draw the next confirmation from its unpaid, not-pending legs. */

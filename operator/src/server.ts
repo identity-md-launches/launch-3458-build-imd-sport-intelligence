@@ -7,7 +7,7 @@ import { issueNonce, verifySignIn, sessionFor, signOut } from "./siwe.ts";
 import { openIntent, submitLeg, historyFor, isEntitled, verifierHealthy } from "./payments.ts";
 import { verifyToken } from "./verify-token.ts";
 import { eventsFor, sportradarAdapter, apiSportsAdapter, type FeedAdapter, type Sport } from "./feeds.ts";
-import { distinctContributors, balance, collect, versionsFor, type SwarmApi } from "./swarm.ts";
+import { distinctContributors, balance, collect, versionsFor, isPurchasableVersion, type SwarmApi } from "./swarm.ts";
 import { swarmFromEnv } from "./research.ts";
 
 export type Deps = { cfg: OperatorConfig; store: Store; reader: ChainReader; feeds: FeedAdapter[]; tokenVerified: () => Promise<boolean>; swarm?: SwarmApi | null };
@@ -63,13 +63,13 @@ export function handler(d: Deps) {
       if (pm && req.method === "GET") {
         const v = decodeURIComponent(pm[1]); const rec = store.db.premium[v] as { release: unknown } | undefined;
         if (!rec) return send(404, { error: "unknown_prediction" });
-        if (!isEntitled(store, me?.address ?? null, v)) return send(402, { error: "not_entitled", purchasable: true });
+        if (!isEntitled(store, me?.address ?? null, v)) return send(402, { error: "not_entitled", purchasable: isPurchasableVersion(store, v) });
         return send(200, rec);
       }
       if (!me) return send(401, { error: "sign_in_required" });
       if (p === "/api/intents" && req.method === "POST") {
         const b = await body(req);
-        const r = await openIntent(store, cfg, reader, me.address, String(b.predictionVersion), (v) => !!store.db.premium[v], await d.tokenVerified());
+        const r = await openIntent(store, cfg, reader, me.address, String(b.predictionVersion), (v) => isPurchasableVersion(store, v), await d.tokenVerified());
         return send(r.ok ? 200 : 409, r);
       }
       const lm = p.match(/^\/api\/intents\/([0-9a-f-]+)\/legs$/);

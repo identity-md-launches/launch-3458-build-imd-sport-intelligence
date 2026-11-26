@@ -5,6 +5,7 @@
  *   node operator/src/research.ts dispatch --sport football --event <id> --cutoff <iso> --evidence evidence.json [--phase research] [--max 12]
  *   node operator/src/research.ts collect [--event <id>]
  *   node operator/src/research.ts status
+ *   node operator/src/research.ts forecast-archive     record the EPL pilot's archive forecasts and results
  *
  * Needs IMD_SPORT_RESEARCH_ACTIVE=1, IMD_PAID_TOKEN and IMD_SWARM_SIGNER_KEY (operator secrets).
  */
@@ -15,12 +16,14 @@ import { loadConfig, type OperatorConfig } from "./config.ts";
 import { Store } from "./store.ts";
 import { httpSwarmApi, planWave, dispatchWave, collect, invalidate, balance, distinctContributors, PHASES, type SwarmApi, type Evidence, type Phase } from "./swarm.ts";
 import { swarmPayer } from "./x402.ts";
+import { backfillEplArchive } from "./forecasts.ts";
 import type { Sport } from "./feeds.ts";
 
 export function swarmFromEnv(cfg: OperatorConfig, env: Record<string, string | undefined> = process.env): SwarmApi | null {
   const key = env.IMD_SWARM_SIGNER_KEY ?? "";
-  if (!cfg.researchActivated || !cfg.imdPaidToken || !/^0x[0-9a-fA-F]{64}$/.test(key)) return null;
-  return httpSwarmApi(cfg, swarmPayer(privateKeyToAccount(key as `0x${string}`), Number(env.IMD_SWARM_CHAIN_ID ?? 1)));
+  // IMD_PAID_TOKEN is the operator's own random 32-byte request token (64 hex), kept across runs.
+  if (!cfg.researchActivated || !/^[0-9a-fA-F]{64}$/.test(cfg.imdPaidToken) || !/^0x[0-9a-fA-F]{64}$/.test(key)) return null;
+  return httpSwarmApi(cfg, swarmPayer(privateKeyToAccount(key as `0x${string}`)));
 }
 
 /** One event: drop work whose evidence changed, then dispatch each phase whose prior phase is accepted. */
@@ -40,6 +43,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const arg = (k: string) => { const i = argv.indexOf(`--${k}`); return i >= 0 ? argv[i + 1] : undefined; };
   const show = (x: unknown) => console.log(JSON.stringify(x, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
   if (argv[0] === "status") return show({ activated: cfg.researchActivated, ...distinctContributors(store), ...balance(store) });
+  if (argv[0] === "forecast-archive") return show(backfillEplArchive(store));
   const api = swarmFromEnv(cfg, env);
   if (!api) { console.error("research is not activated: set IMD_SPORT_RESEARCH_ACTIVE=1, IMD_PAID_TOKEN and IMD_SWARM_SIGNER_KEY"); process.exitCode = 2; return; }
   if (argv[0] === "collect") return show(await collect(store, api, arg("event")));

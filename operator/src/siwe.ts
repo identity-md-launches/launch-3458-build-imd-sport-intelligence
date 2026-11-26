@@ -31,10 +31,14 @@ export async function verifySignIn(store: Store, cfg: OperatorConfig, message: s
   if (!valid) return { ok: false, error: "bad_signature" };
   const token = randomBytes(32).toString("hex");
   const expiresAt = now + cfg.sessionTtlSeconds * 1000;
-  store.tx((db) => {
-    delete db.nonces[m.nonce!]; // single use, consumed only on success
+  const consumed = store.tx((db) => {
+    // Single use, consumed only on success, and re-checked under the shared lock so two processes cannot both spend it.
+    if (!db.nonces[m.nonce!]) return false;
+    delete db.nonces[m.nonce!];
     db.sessions[token] = { address: getAddress(m.address!), chainId: m.chainId!, expiresAt };
+    return true;
   });
+  if (!consumed) return { ok: false, error: "unknown_or_expired_nonce" };
   return { ok: true, token, address: getAddress(m.address), expiresAt };
 }
 

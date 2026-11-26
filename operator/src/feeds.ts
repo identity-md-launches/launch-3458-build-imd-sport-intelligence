@@ -18,6 +18,8 @@ export type NormEvent = {
   outcomeModel: "three-way" | "two-way";        // football has draws; the other five are two-way
   observedUtc: string; sources: string[]; freshnessSeconds: number; corroboratedBy: string[];
   availability: Availability[];
+  /** Who won and how, when the source says so. Draws and no contests are explicit results, not missing data. */
+  result?: { outcome: "home" | "away" | "draw" | "no-contest" | null; winner: string | null; method: string | null };
 };
 export const OUTCOME_MODEL: Record<Sport, "three-way" | "two-way"> = { football: "three-way", mma: "two-way", nhl: "two-way", nfl: "two-way", nba: "two-way", tennis: "two-way" };
 /** Older than this, a live or scheduled observation is reported stale rather than current. */
@@ -45,7 +47,7 @@ export function decidedIn(sport: Sport, marker: string | undefined): Period {
 /** Free-text classifier for sources without structured status. Negated injury text is not an injury. */
 export function availabilityKind(text: string): AvailabilityKind {
   const t = text.toLowerCase();
-  const injuryStated = /injur|torn|fracture|strain|sprain|concussion|knock|hamstring|knee|ankle|shoulder|groin|calf|back\b|illness/.test(t) && !/no injury|not injury|non-injury|without injury/.test(t);
+  const injuryStated = /injur|torn|fracture|(lower|upper)[ -]body|foot|wrist|hip|elbow|achilles|\bacl\b|\bmcl\b|\bribs?\b|neck|thigh|\btoe\b|finger|thumb|surgery|strain|sprain|concussion|knock|hamstring|knee|ankle|shoulder|groin|calf|back\b|illness/.test(t) && !/no injury|not injury|non-injury|without injury/.test(t);
   if (/suspend|\bban\b|red card|yellow card/.test(t)) return "suspension";
   if (/withdr|pulled out|scratch|replaced on the card|walkover|personal|not injury related|rest\b/.test(t) && !injuryStated) return "withdrawal";
   if (/questionable|doubtful|day.to.day|probable|game.time/.test(t)) return "questionable";
@@ -64,8 +66,11 @@ export function availabilityFrom(status: string, reason: string): AvailabilityKi
   if (/not injury related|personal|rest|coach|international duty|national team|family|load management/.test(r)) return "withdrawal";
   if (/questionable|doubtful|probable|day to day|day-to-day/.test(s)) return "questionable";
   if (!r || /^unknown|^undisclosed|^other$|^n\/a/.test(r)) return "unknown-reason";
+  if (/withdr|scratch|walkover|pulled out/.test(s)) return "withdrawal"; // the provider's own status confirms a withdrawal
   const k = availabilityKind(r);
-  return k === "available" ? "confirmed-injury" : k; // a named body part or ailment under an "out" status is a reported injury
+  // Only a named body part or ailment is a reported injury. Any other reason ("No injury reported",
+  // "Visa issue") is an absence whose cause the provider has not classified.
+  return k === "available" ? "unknown-reason" : k;
 }
 
 /** Merge observations of one event from several adapters; agreement adds corroboration. */
@@ -103,6 +108,8 @@ const unavailable = (reason: string): AvailabilityFeed => ({ status: "unavailabl
  *   Tennis v3 /tennis/{access}/v3/en/schedules/{yyyy-mm-dd}/summaries.json
  * The operator's contract must cover a paid analysis product.
  */
+/** Days of daily routes read per refresh: today (live and finals) plus the upcoming window. */
+export const WINDOW_DAYS = { nhl: 3, nba: 3, mma: 8, tennis: 3 } as const;
 export function sportradarAdapter(key: string, f: Fetch = fetch, access: "trial" | "production" = "trial"): FeedAdapter {
   const B = "https://api.sportradar.com";
   const h = { "x-api-key": key, accept: "application/json" };
@@ -125,11 +132,29 @@ export function sportradarAdapter(key: string, f: Fetch = fetch, access: "trial"
     const state = /cancel|postpon|abandon/.test(String(st.status)) ? "cancelled" : String(st.status ?? "");
     const c = classify({ state, observedUtc, startUtc: ev.start_time }, now);
     const method = String(st.method ?? st.match_status ?? "");
+    const w = String(st.winner ?? "").toLowerCase(), wid = st.winner_id;
+    const noContest = /no.?contest|\bnc\b/.test(method.toLowerCase()) || /no.?contest/.test(w);
+    const draw = !noContest && (/draw/.test(w) || /draw/.test(method.toLowerCase()));
+    const side: "home" | "away" | null = wid ? (wid === home.id ? "home" : wid === away.id ? "away" : null) : /^home/.test(w) ? "home" : /^away/.test(w) ? "away" : null;
+    const result: NormEvent["result"] = c.status === "final" || st.winner || wid || noContest || draw
+      ? { outcome: noContest ? "no-contest" : draw ? "draw" : side, winner: side === "home" ? home.name ?? null : side === "away" ? away.name ?? null : null, method: method || null }
+      : undefined;
     return { id: `sportradar:${sport}:${ev.id}`, sport, competition: ev.sport_event_context?.competition?.name ?? (sport === "mma" ? "MMA" : "Tennis"), startUtc: new Date(ev.start_time).toISOString(),
       home: home.name, away: away.name, status: c.status, freshnessSeconds: c.freshnessSeconds,
       score: st.home_score != null && st.away_score != null ? [st.home_score, st.away_score] : null,
       decidedIn: c.status === "final" ? (sport === "mma" ? decidedIn("mma", method || "finish") : /walkover|retired|defaulted/.test(method) ? "finish" : "regulation") : null,
-      outcomeModel: "two-way", observedUtc, sources: [url], corroboratedBy: [], availability: [] };
+      outcomeModel: "two-way", observedUtc, sources: [url], corroboratedBy: [], availability: [], ...(result ? { result } : {}) };
+  };
+  /**
+   * Today's route carries live and just-finished events; the following days carry the upcoming
+   * schedule. Today must answer; a failing future day only shortens the window. Merged by event ID,
+   * the earliest route's observation wins.
+   */
+  const days = async (n: number, now: number, urlFor: (day: number) => string, rows: (j: any, url: string) => NormEvent[]) => {
+    const out = new Map<string, NormEvent>();
+    const got = await Promise.all(Array.from({ length: n }, (_, d) => { const url = urlFor(now + d * 86400_000); return getJson(f, url, h).then((j) => rows(j, url), (e) => { if (d === 0) throw e; return [] as NormEvent[]; }); }));
+    for (const list of got) for (const e of list) if (!out.has(e.id)) out.set(e.id, e);
+    return [...out.values()];
   };
   const injuryRows = (sport: Sport, j: any, url: string, now: number): Availability[] => (j.teams ?? []).flatMap((t: any) => (t.players ?? []).flatMap((p: any) => (p.injuries ?? []).map((inj: any) => {
     const status = String(inj.status ?? ""), reason = String(inj.desc ?? inj.primary ?? "");
@@ -140,15 +165,11 @@ export function sportradarAdapter(key: string, f: Fetch = fetch, access: "trial"
     name: "sportradar", needsKey: true, sports: ["nhl", "nba", "nfl", "mma", "tennis"],
     async fetchEvents(sport, now = Date.now()) {
       if (!key) return [];
-      if (sport === "nhl" || sport === "nba") {
-        const url = `${B}/${sport}/${access}/${sport === "nhl" ? "v7" : "v8"}/en/games/${ymd(now, "/")}/schedule.json`;
-        return ((await getJson(f, url, h)).games ?? []).map((g: any) => usGame(sport, g, url, now));
-      }
+      if (sport === "nhl" || sport === "nba")
+        return days(WINDOW_DAYS[sport], now, (t) => `${B}/${sport}/${access}/${sport === "nhl" ? "v7" : "v8"}/en/games/${ymd(t, "/")}/schedule.json`, (j, url) => (j.games ?? []).map((g: any) => usGame(sport, g, url, now)));
       if (sport === "nfl") { const { url, j } = await nflWeek(); return (j.week?.games ?? j.games ?? []).map((g: any) => usGame("nfl", g, url, now)); }
-      if (sport === "mma" || sport === "tennis") {
-        const url = `${B}/${sport}/${access}/${sport === "mma" ? "v2" : "v3"}/en/schedules/${ymd(now, "-")}/summaries.json`;
-        return ((await getJson(f, url, h)).summaries ?? []).map((s: any) => summary(sport, s, url, now));
-      }
+      if (sport === "mma" || sport === "tennis")
+        return days(WINDOW_DAYS[sport], now, (t) => `${B}/${sport}/${access}/${sport === "mma" ? "v2" : "v3"}/en/schedules/${ymd(t, "-")}/summaries.json`, (j, url) => (j.summaries ?? []).map((s: any) => summary(sport, s, url, now)));
       return [];
     },
     async fetchAvailability(sport, now = Date.now()) {

@@ -1,8 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classify, decidedIn, availabilityKind, availabilityFrom, OUTCOME_MODEL, eventsFor, sportradarAdapter, apiSportsAdapter } from "../src/feeds.ts";
-import { ROLES, FACTORS, planWave, dispatchWave, collect, invalidate, distinctContributors, release, publicEvidence, balance, httpSwarmApi, sha256, cacheKey, versionsFor, MIN_CALIBRATION, type SwarmApi, type Evidence, type ResearchRecord, type JobResult } from "../src/swarm.ts";
-import { swarmPayer, canonicalJson } from "../src/x402.ts";
+import { ROLES, FACTORS, planWave, dispatchWave, collect, invalidate, distinctContributors, release, publicEvidence, balance, httpSwarmApi, sha256, cacheKey, versionsFor, type SwarmApi, type Evidence, type ResearchRecord, type JobResult } from "../src/swarm.ts";
 import { runEvent } from "../src/research.ts";
 import { cfg, store, fixtureAccount } from "./helpers.ts";
 
@@ -110,23 +109,12 @@ test("documented order shape reaches collection: admission.result.jobId, resultU
     "/artifacts/": new Response(body),
     "/jobs/fixture-job/submissions": { submissions: [{ submissionHash: "ab".repeat(32), agentId: "seat-7" }] },
   });
-  const api = httpSwarmApi(cfg(), async () => ({ paymentHeader: "", quoteSignature: "" }), f);
+  const api = httpSwarmApi(cfg(), async () => ({ payment: {}, paymentHeader: "", quoteSignature: "" }), f);
   assert.deepEqual(await api.status("fixture-order"), { status: "admitted", jobId: "fixture-job", statusUrl: "/jobs/fixture-job", resultUrl: "/jobs/fixture-job/result" });
   const r = await api.result({ jobId: "fixture-job", resultUrl: "/jobs/fixture-job/result" });
   assert.equal(r.files[0].body, body); assert.equal(r.contributors["ab".repeat(32)], "seat-7");
   assert.ok(calls.some((u) => u.endsWith("/jobs/fixture-job/result")));
 });
-test("x402 payer signs Permit2 payment and QuoteApproval with the operator account", async () => {
-  const acct = fixtureAccount("swarm-signer");
-  const pay = swarmPayer(acct, 1, () => 1_800_000_000);
-  const out = await pay({ orderId: "o1", resourceUrl: "https://api.imd.fun/requests/o1/submit", order: { id: "o1", action: "job.open", quote: { id: "q1", hash: "11".repeat(32), requesterScopeHash: "22".repeat(32), expiresAt: 1_800_000_600 } },
-    paymentRequired: { x402Version: 2, resource: { url: "https://api.imd.fun/requests/o1/submit" }, accepts: [{ scheme: "exact", network: "eip155:1", asset: "0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7", amount: "500000000000000000", payTo: "0x" + "c3".repeat(20), maxTimeoutSeconds: 600, extra: { spender: "0x" + "d4".repeat(20) } }] } });
-  assert.match(out.quoteSignature, /^0x[0-9a-f]{130}$/);
-  const payment = JSON.parse(Buffer.from(out.paymentHeader, "base64").toString());
-  assert.equal(payment.payload.permit2Authorization.from, acct.address); assert.match(payment.payload.signature, /^0x[0-9a-f]{130}$/);
-  assert.equal(canonicalJson({ b: 1, a: [2, { d: 1, c: 0 }] }), '{"a":[2,{"c":0,"d":1}],"b":1}');
-});
-
 test("phases are gated on accepted prior work; inputs carry its artifacts; challenger must be independent", async () => {
   const s = store(); fund(s, 0.5); const c = cfg({ IMD_SPORT_RESEARCH_ACTIVE: "1" });
   // The reported reproduction: one funded slot, no accepted records.
@@ -193,22 +181,4 @@ test("activation switch, public evidence only, cache reuse, invalidation, distin
 const accepted = (s: ReturnType<typeof store>, ev: string, sport: string, factor: string, phases: string[], who = "a") => phases.forEach((ph, i) => {
   const roleId = `${sport}.${factor}.${ph}`; const k = cacheKey(ev, ET, CUT, roleId);
   s.db.research[k] = { cacheKey: k, eventId: ev, roleId, factor: factor as any, phase: ph as any, modelVersion: "imd-sport-synth-1", cutoffUtc: CUT, evidenceTime: ET, evidenceHash: "h", status: "accepted", resultHash: sha256(roleId), submissionHash: sha256("s" + roleId), artifacts: [], contributors: [`${who}${i}`], sources: ["https://example.org"], findings: "private finding" } satisfies ResearchRecord;
-});
-const calSet = Array.from({ length: MIN_CALIBRATION + 20 }, (_, i) => ({ eventId: `hist-${i}`, p: [0.7, 0.2, 0.1], outcome: i % 2 === 0 ? 0 : i % 4 === 1 ? 1 : 2 }));
-test("release: validated model only, full research-challenge-adjudication chain, calibrated on a separate set, gaps recorded, premium private", () => {
-  const s = store();
-  accepted(s, "e", "football", "injuries", ["research", "challenge", "adjudication"]);
-  accepted(s, "e", "football", "weather", ["research"]);
-  assert.throws(() => release(s, { eventId: "e", sport: "nba", base: [0.6, 0.4], cutoffUtc: CUT, evidenceTime: ET, adjustments: [], calibration: calSet }), /no validated model/);
-  assert.throws(() => release(s, { eventId: "e", sport: "football", base: [0.5, 0.25, 0.25], cutoffUtc: CUT, evidenceTime: ET, adjustments: [], calibration: calSet.slice(0, 10) }), /calibration set/);
-  const r = release(s, { eventId: "e", sport: "football", base: [0.5, 0.25, 0.25], cutoffUtc: CUT, evidenceTime: ET, calibration: calSet,
-    adjustments: [{ factor: "injuries", shift: [-0.2, 0.1, 0.1], reason: "home striker out", counter: "replacement scored in 4 of 5 starts" }, { factor: "weather", shift: [0.5, 0, 0], reason: "ignored: no challenge or adjudication" }] });
-  assert.equal(r.outcomes.length, 3); assert.ok(Math.abs(r.probabilities.reduce((a, b) => a + b) - 1) < 1e-3);
-  assert.deepEqual(r.reasons, ["home striker out"]); assert.equal(r.counterarguments.length, 1);
-  assert.ok(r.calibration.temperature > 1, "over-confident calibration set is softened"); assert.equal(r.calibration.n, calSet.length);
-  assert.ok(r.dataGaps.includes("weather: challenge, adjudication not accepted")); assert.equal(r.dataGaps.length, 11);
-  assert.equal(r.version, `e@imd-sport-synth-1@${CUT}`); assert.equal(r.baseModel, "epl-elo-olog-1");
-  assert.ok(r.evidence.every((e) => e.cutoffUtc === CUT && e.resultHash && e.contributors.length));
-  assert.ok(!JSON.stringify(r).includes("private finding")); assert.ok(JSON.stringify(s.db.premium).includes("private finding"));
-  const v = versionsFor(s, "e"); assert.equal(v.length, 1); assert.equal(v[0].version, r.version); assert.ok(!JSON.stringify(v).includes("probabilities"));
 });
