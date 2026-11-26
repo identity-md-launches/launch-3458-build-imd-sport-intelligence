@@ -1,0 +1,13 @@
+# dependencies and caches (every nesting level)
+node_modules/
+**/node_modules/
+.npm/
+.cache/
+*.tgz
+# operator private store and secrets
+.operator-data/
+**/.operator-data/
+.env
+.env.*
+# scratch
+test/scratch/

@@ -1,0 +1,35 @@
+{
+  "name": "imd-sport-intelligence",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "IMD Sport Intelligence: static sports analysis site plus operator companion service.",
+  "scripts": {
+    "dev": "vite",
+    "backtest": "node scripts/backtest.ts",
+    "build": "node scripts/backtest.ts --check && vite build",
+    "preview": "vite preview --base ./",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p operator/tsconfig.json",
+    "test": "node --test operator/test/*.test.ts test/site/*.test.ts",
+    "operator": "node operator/src/server.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.108.4",
+    "@walletconnect/ethereum-provider": "^2.26.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "viem": "^2.58.6",
+    "wagmi": "^2.19.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.11",
+    "@types/react": "^19.3.3",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.8"
+  }
+}
