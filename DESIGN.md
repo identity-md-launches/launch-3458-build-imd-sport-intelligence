@@ -59,3 +59,22 @@ numerals for every number.
 - 900px+: header nav appears; home hero becomes two columns (copy left, featured match right); h1 at 40px;
   accuracy chart and bin table side by side.
 - `prefers-reduced-motion` removes transitions. No animation runs continuously.
+
+## Components added in the November revision
+
+- **Connect sheet**: a native `<dialog>` opened with `showModal()` (`.sheet`, `::backdrop` rgba(0,0,0,.6)).
+  Bottom sheet under 640px (`margin: auto auto 0`, 16px top radius), centred card above. Escape, the × button
+  and a backdrop click all close it; focus returns to the Connect (or connected-wallet) button.
+- **Wallet control**: `Switch to Ethereum` (gold) whenever the wallet reports a chain other than 1; otherwise the
+  short address with Disconnect (quiet).
+- **Feed list** (`.feed`): one surface card per event with a status badge (Live, Final, Scheduled, Stale,
+  Unavailable), competition, how it was decided (Regulation, Overtime, Shootout, After extra time), Draw possible
+  or Two-way, score, start and observation time with age, corroboration count, source host links and the event ID.
+- **Availability table**: player, team, kind (Confirmed injury; Withdrawal, no injury reported; Out, reason not
+  given; Suspension; Questionable), source detail and observed time, in the shared `.tbl` with horizontal scroll.
+- **Prediction versions and synthesis**: each released version with its cutoff and a gold "Review the purchase"
+  or "Resume the purchase"; the leg table marks Verified, Sent, waiting for finality, or To pay; a quiet
+  "Check the sent transfer again" button; the entitled synthesis (`.synth`) shows the probability bar,
+  confidence, cutoff, calibration, reasons, counterarguments and data gaps.
+- **Football upcoming**: "Scheduled in the September 2026 snapshot" lists future kick-offs first; past fixtures
+  without a result sit below in a separately headed stale archive.

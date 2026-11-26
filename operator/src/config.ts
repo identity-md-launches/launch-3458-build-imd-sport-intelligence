@@ -21,7 +21,6 @@ export type OperatorConfig = {
   sessionTtlSeconds: number;
   nonceTtlSeconds: number;
   intentTtlSeconds: number;
-  confirmations: number;          // blocks after which a Transfer log counts as final
   dataDir: string;                // private store, never published
   imdApi: string;                 // IMD Swarm API base
   imdPaidToken: string;           // bearer token for paid request routes, operator secret
@@ -46,7 +45,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     sessionTtlSeconds: Number(env.IMD_SPORT_SESSION_TTL ?? 8 * 3600),
     nonceTtlSeconds: Number(env.IMD_SPORT_NONCE_TTL ?? 600),
     intentTtlSeconds: Number(env.IMD_SPORT_INTENT_TTL ?? 3600),
-    confirmations: Number(env.IMD_SPORT_CONFIRMATIONS ?? 12),
     dataDir: env.IMD_SPORT_DATA_DIR ?? "./.operator-data",
     imdApi: env.IMD_API ?? "https://api.imd.fun",
     imdPaidToken: env.IMD_PAID_TOKEN ?? "",

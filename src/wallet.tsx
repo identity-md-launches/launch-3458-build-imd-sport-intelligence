@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { createConfig, http, useAccount, useConnect, useDisconnect, useChainId, useSwitchChain, type Connector } from "wagmi";
+import { useEffect, useRef, useState } from "react";
+import { createConfig, http, useAccount, useConnect, useDisconnect, useSwitchChain, type Connector } from "wagmi";
 import { injected, walletConnect } from "wagmi/connectors";
 import { mainnet } from "viem/chains";
 import { createSiweMessage } from "viem/siwe";
@@ -23,29 +23,33 @@ export const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
 export function ConnectSheet() {
   const mobile = isMobile();
-  const { address, isConnected } = useAccount();
-  const chainId = useChainId();
+  // useAccount().chainId is the wallet's actual chain, even one this config does not list (useChainId is not).
+  const { address, isConnected, chainId } = useAccount();
   const { switchChain } = useSwitchChain();
   const { connectors, connect, isPending, variables, error } = useConnect();
   const { disconnect } = useDisconnect();
   const [open, setOpen] = useState(false);
-  useEffect(() => { if (!open) return; const k = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false); addEventListener("keydown", k); return () => removeEventListener("keydown", k); }, [open]);
+  const dlg = useRef<HTMLDialogElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  // A native modal dialog keeps Tab inside the sheet; Escape and Close both end in onClose, which returns focus.
+  useEffect(() => { const d = dlg.current; if (!d) return; if (open && !d.open) d.showModal(); if (!open && d.open) d.close(); }, [open]);
   useEffect(() => { if (isConnected) setOpen(false); }, [isConnected]);
   const named = connectors.some((c) => c.type === "injected" && c.id !== "injected");
   const listed = [...connectors.filter((c) => c.type === "injected"), ...connectors.filter((c) => c.type !== "injected")].filter((c) => !(c.id === "injected" && named));
   const label = (c: Connector) => (c.id === "injected" ? "Browser wallet" : c.name);
   const icon = (c: Connector) => c.icon ?? (c.id === "walletConnect" ? `data:image/svg+xml;utf8,${encodeURIComponent(WC_ICON)}` : undefined);
-  if (isConnected && address) {
-    if (chainId !== mainnet.id) return <button className="btn btn-gold" onClick={() => switchChain({ chainId: mainnet.id })}>Switch to Ethereum</button>;
-    return <button className="btn btn-quiet" onClick={() => { disconnect(); session.clear(); }} title="Disconnect"><span className="mono">{short(address)}</span> · Disconnect</button>;
-  }
+  const onClose = () => { setOpen(false); setTimeout(() => trigger.current?.focus(), 0); };
   return (
     <>
-      <button className="btn btn-quiet" onClick={() => setOpen(true)}>Connect</button>
-      {open && (
-        <div className="sheet-bg" onClick={() => setOpen(false)}>
-          <div className="sheet" role="dialog" aria-modal="true" aria-label="Connect a wallet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-head"><h2>Connect a wallet</h2><button className="x" aria-label="Close" onClick={() => setOpen(false)} autoFocus>×</button></div>
+      {isConnected && address ? (
+        chainId !== mainnet.id
+          ? <button ref={trigger} className="btn btn-gold" onClick={() => switchChain({ chainId: mainnet.id })}>Switch to Ethereum</button>
+          : <button ref={trigger} className="btn btn-quiet" onClick={() => { disconnect(); session.clear(); }} title="Disconnect"><span className="mono">{short(address)}</span> · Disconnect</button>
+      ) : <button ref={trigger} className="btn btn-quiet" onClick={() => setOpen(true)}>Connect</button>}
+      <dialog ref={dlg} className="sheet" aria-labelledby="connect-title" onClose={onClose} onClick={(e) => { if (e.target === dlg.current) dlg.current.close(); }}>
+        {open && (
+          <>
+            <div className="sheet-head"><h2 id="connect-title">Connect a wallet</h2><button className="x" aria-label="Close" onClick={() => dlg.current?.close()} autoFocus>×</button></div>
             <p className="muted small">Connecting is free. It is only needed to sign in for purchase history and receipts.</p>
             {mobile && <a className="row" href={MM_LINK(location.href)}><span className="ic" aria-hidden>M</span><span>Open in MetaMask</span></a>}
             {listed.filter((c) => !mobile || c.type !== "injected").map((c) => (
@@ -56,9 +60,9 @@ export function ConnectSheet() {
             ))}
             {!listed.length && !mobile && <p className="muted small">No browser wallet found. Install MetaMask or Rabby, then reload.</p>}
             {error && <p className="note" role="status">{error.message.split("\n")[0]}</p>}
-          </div>
-        </div>
-      )}
+          </>
+        )}
+      </dialog>
     </>
   );
 }
@@ -79,35 +83,65 @@ export async function signIn(address: `0x${string}`): Promise<string | null> {
   const signature = await p.request({ method: "personal_sign", params: [message, address] });
   const v = await api<{ ok: boolean; token?: string; error?: string }>("/api/siwe/verify", { method: "POST", body: JSON.stringify({ message, signature }) });
   if (!v.ok || !v.data.token) return `Sign-in refused: ${v.data.error ?? "unknown"}`;
-  session.set(v.data.token); return null;
+  session.set(v.data.token, address); return null;
+}
+
+/** Broadcast hashes not yet verified, kept per intent so an interruption never asks for the same transfer again. */
+const PKEY = (intentId: string) => `imd-sport-pending:${intentId}`;
+export const pendingHashes = {
+  get: (intentId: string): Record<string, string> => { try { return JSON.parse(localStorage.getItem(PKEY(intentId)) ?? "{}"); } catch { return {}; } },
+  set: (intentId: string, legs: string[], hash: string) => { const m = pendingHashes.get(intentId); legs.forEach((l) => (m[l] = hash)); localStorage.setItem(PKEY(intentId), JSON.stringify(m)); },
+  drop: (intentId: string, legs: string[]) => { const m = pendingHashes.get(intentId); legs.forEach((l) => delete m[l]); if (Object.keys(m).length) localStorage.setItem(PKEY(intentId), JSON.stringify(m)); else localStorage.removeItem(PKEY(intentId)); },
+};
+export type LegReply = { ok: boolean; verified: string[]; entitled?: boolean; error?: string; pending?: boolean };
+const PENDING_ERRORS = new Set(["receipt_not_found", "not_final", "receipt_not_canonical"]);
+export const postLeg = (intentId: string, txHash: string) => api<LegReply>(`/api/intents/${intentId}/legs`, { method: "POST", body: JSON.stringify({ txHash }) });
+
+/** Re-verify every persisted hash before anything new is requested. Returns legs still waiting on finality. */
+export async function reconcilePending(intentId: string): Promise<{ entitled: boolean; waiting: string[]; errors: string[] }> {
+  let entitled = false; const errors: string[] = [];
+  const byHash = new Map<string, string[]>();
+  for (const [leg, h] of Object.entries(pendingHashes.get(intentId))) byHash.set(h, [...(byHash.get(h) ?? []), leg]);
+  for (const [h, legs] of byHash) {
+    const r = await postLeg(intentId, h);
+    if (r.data?.ok) { pendingHashes.drop(intentId, legs); entitled ||= !!r.data.entitled; }
+    else if (r.status === 0 || PENDING_ERRORS.has(r.data?.error ?? "") || r.data?.pending) continue; // keep waiting; never re-request this leg
+    else { pendingHashes.drop(intentId, legs); errors.push(`${legs.join(" and ")} transfer: ${r.data?.error ?? "refused"}`); }
+  }
+  return { entitled, waiting: Object.keys(pendingHashes.get(intentId)), errors };
+}
+
+async function ensureMainnet(p: Eip1193) {
+  const id = await p.request({ method: "eth_chainId" });
+  if (Number(id) !== mainnet.id) throw new Error("Your wallet is not on Ethereum Mainnet. Use Switch to Ethereum, then try again.");
 }
 
 /**
- * Pay the missing legs of an intent. Atomic batch (EIP-5792 wallet_sendCalls) when the wallet
- * reports it; otherwise one confirmation per leg. Each hash goes to the verifier as it lands, so an
- * interrupted purchase keeps its verified half.
+ * Pay the given (unpaid, not pending) legs of an intent. Atomic batch (EIP-5792 wallet_sendCalls)
+ * when the wallet reports it; otherwise one confirmation per leg. Every hash is persisted before it
+ * is verified, and the chain is re-checked right before each wallet request.
  */
 export async function payLegs(intentId: string, from: string, calls: { to: string; data: string; leg: string }[], onStep: (s: string) => void) {
   const p = await provider(); if (!p) throw new Error("No wallet connected.");
+  await ensureMainnet(p);
   let atomic = false;
   try { const caps = await p.request({ method: "wallet_getCapabilities", params: [from, ["0x1"]] }); const c = caps?.["0x1"] ?? caps?.[1]; atomic = c?.atomic?.status === "supported" || c?.atomic?.status === "ready" || c?.atomicBatch?.supported === true; } catch { atomic = false; }
-  const post = (txHash: string) => api<{ ok: boolean; verified: string[]; entitled?: boolean; error?: string }>(`/api/intents/${intentId}/legs`, { method: "POST", body: JSON.stringify({ txHash }) });
   if (atomic && calls.length > 1) {
     onStep("Confirm one batch in your wallet");
+    await ensureMainnet(p);
     const { id } = await p.request({ method: "wallet_sendCalls", params: [{ version: "2.0.0", chainId: "0x1", from, atomicRequired: true, calls: calls.map((c) => ({ to: c.to, data: c.data, value: "0x0" })) }] });
     for (let i = 0; i < 120; i++) {
       const s = await p.request({ method: "wallet_getCallsStatus", params: [id] });
       const hashes: string[] = [...new Set<string>((s?.receipts ?? []).map((r: { transactionHash: string }) => r.transactionHash))];
-      if (hashes.length) { onStep("Waiting for finality, then verifying"); return Promise.all(hashes.map(post)); }
+      if (hashes.length) { hashes.forEach((h) => pendingHashes.set(intentId, calls.map((c) => c.leg), h)); onStep("Sent. Waiting for Ethereum finality, then verifying"); return; }
       await new Promise((r) => setTimeout(r, 3000));
     }
     throw new Error("The batch has not landed yet. Reopen this prediction to resume.");
   }
-  const out = [];
   for (const [i, c] of calls.entries()) {
-    onStep(`Confirm transfer ${i + 1} of ${calls.length} in your wallet (${c.leg} leg)`);
-    const hash = await p.request({ method: "eth_sendTransaction", params: [{ from, to: c.to, data: c.data, value: "0x0" }] });
-    out.push(await post(hash));
+    onStep(`Confirm transfer ${i + 1} of ${calls.length} in your wallet (${c.leg === "developer" ? "developer" : "Swarm research"} leg)`);
+    await ensureMainnet(p);
+    const hash = await p.request({ method: "eth_sendTransaction", params: [{ from, to: c.to, data: c.data, value: "0x0", chainId: "0x1" }] });
+    pendingHashes.set(intentId, [c.leg], hash);
   }
-  return out;
 }

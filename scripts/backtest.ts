@@ -125,6 +125,9 @@ export function run(root = ROOT) {
   const P = best!.P;
   const { rows, elo } = walk(files, P);
   const train = rows.filter((r) => TRAIN.includes(r.season) && r.result);
+  // Parameter selection scored the training results after the warm-up matchdays; ratings used every training result.
+  const isWarmup = (r: Row) => r.season === "2022-23" && Number(r.round.replace(/\D/g, "")) <= 8;
+  const selection = { matches: train.filter((r) => !isWarmup(r)).length, warmupExcluded: train.filter(isWarmup).length, warmupRule: "matchdays 1-8 of 2022-23" };
   const calib = rows.filter((r) => r.season === CALIB && r.result);
   // 2. calibration: a single temperature fitted on 2024-25 only
   let T = 1, bestLL = Infinity;
@@ -151,7 +154,7 @@ export function run(root = ROOT) {
     asOf: SOURCE.commitDate,
     model: { name: "Elo with ordered-logit draw band, temperature-calibrated", version: "epl-elo-olog-1", params: P, temperature: T },
     splits: {
-      training: { seasons: TRAIN, matches: train.length },
+      training: { seasons: TRAIN, matches: train.length, parameterSelection: selection },
       calibration: { seasons: [CALIB], matches: calib.length },
       heldOut: { seasons: [HOLDOUT], matches: hold.length, excludedNoResult: holdAll.length - hold.length },
     },

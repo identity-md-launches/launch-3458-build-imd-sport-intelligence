@@ -59,7 +59,7 @@ test("partial payment keeps its verified leg after expiry and resumes at the mis
   const later = t0 + 10 * 3600 * 1000; // well past the intent TTL
   const resumed = await openIntent(s, cfg(), c, buyer, V, purch, true, later); if (!resumed.ok || resumed.alreadyEntitled) throw 0;
   assert.equal(resumed.intent.id, a.intent.id); assert.deepEqual(resumed.calls.map((x) => x.leg), ["developer"]);
-  c.receipts[txh(4)] = receipt(txh(4), buyer, [transferLog(buyer, DEV, 0, txh(4))], 150);
+  c.head = 260; c.receipts[txh(4)] = receipt(txh(4), buyer, [transferLog(buyer, DEV, 0, txh(4))], 150);
   const fin = await submitLeg(s, cfg(), c, buyer, a.intent.id, txh(4), later);
   assert.equal(fin.entitled, true);
 });
@@ -88,4 +88,22 @@ test("user isolation: another session cannot submit to, read, or inherit an inte
   assert.equal(historyFor(s, other).length, 0); assert.equal(historyFor(s, buyer).length, 1);
   assert.equal(isEntitled(s, other, V), false);
   assert.match(historyFor(s, buyer)[0].legs[0].explorer!, /^https:\/\/etherscan\.io\/tx\/0x/);
+});
+
+test("finality: a receipt above the finalized block stays pending; non-canonical blocks are refused; health needs finality", async () => {
+  const s = setup(); const c = fixtureChain({ head: 100 });
+  const a = await openIntent(s, cfg(), c, buyer, V, purch, true); if (!a.ok || a.alreadyEntitled) throw 0;
+  // The reported reproduction: head 140, finalized 110, receipt at 120 with both exact legs.
+  c.head = 140; c.finalized = 110;
+  c.receipts[txh(20)] = receipt(txh(20), buyer, [transferLog(buyer, DEV, 0, txh(20)), transferLog(buyer, RES, 1, txh(20))], 120);
+  const pend = await submitLeg(s, cfg(), c, buyer, a.intent.id, txh(20));
+  assert.equal(pend.error, "not_final"); assert.equal(pend.pending, true); assert.deepEqual(pend.verified, []);
+  assert.equal(isEntitled(s, buyer, V), false); assert.equal(Object.keys(s.db.reservations).length, 0);
+  c.reorged.add(120); c.finalized = 130;
+  assert.equal((await submitLeg(s, cfg(), c, buyer, a.intent.id, txh(20))).error, "receipt_not_canonical");
+  c.reorged.clear();
+  const fin = await submitLeg(s, cfg(), c, buyer, a.intent.id, txh(20));
+  assert.deepEqual(fin.verified.sort(), ["developer", "research"]); assert.equal(fin.entitled, true);
+  const noFinal = { ...fixtureChain(), finalizedBlock: async () => { throw new Error("finalized tag unsupported"); } };
+  assert.equal((await openIntent(setup(), cfg(), noFinal, buyer, V, purch, true)).ok, false);
 });

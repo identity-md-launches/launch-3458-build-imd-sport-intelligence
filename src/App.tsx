@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useAccount } from "wagmi";
 import epl from "./data/epl.json";
 import { Logo, SportArt } from "./art";
-import { ConnectSheet, signIn, payLegs, short } from "./wallet";
+import { ConnectSheet, signIn, payLegs, reconcilePending, pendingHashes, short } from "./wallet";
 import { COMPANION_ORIGIN, WALLETCONNECT_PROJECT_ID, TOKEN } from "./release";
-import { api, getStatus, session, type Status } from "./companion";
+import { api, getStatus, session, type Status, type FeedResponse, type FeedEvent, type FeedAvailability } from "./companion";
 
 type M = { id: string; season: string; round: string; kickoffUtc: string; home: string; away: string; p: number[]; result: "H" | "D" | "A" | null; ft: number[] | null; eloHome: number; eloAway: number };
 const HELD = epl.heldOut as M[];
@@ -42,8 +42,33 @@ function useStatus() {
   return { status: s, tried };
 }
 
+/** Feed data for one sport from the companion's /api/feeds/:sport, requested when the view opens. */
+function useFeed(sport: string) {
+  const [st, setSt] = useState<{ state: "off" | "loading" | "ok" | "unavailable"; data?: FeedResponse; reason?: string }>({ state: COMPANION_ORIGIN ? "loading" : "off" });
+  useEffect(() => {
+    if (!COMPANION_ORIGIN) return;
+    let live = true; setSt({ state: "loading" });
+    api<FeedResponse>(`/api/feeds/${sport}`).then((r) => { if (!live) return; if (r.ok && r.data.status === "ok") setSt({ state: "ok", data: r.data }); else setSt({ state: "unavailable", data: r.ok ? r.data : undefined, reason: r.ok ? r.data.reason : "the companion service did not answer" }); });
+    return () => { live = false; };
+  }, [sport]);
+  return st;
+}
+/** Private screen state belongs to one address on one chain; a change drops it and the session. */
+function usePrivateScope() {
+  const { address, chainId } = useAccount();
+  const scope = address ? `${address.toLowerCase()}:${chainId}` : "";
+  const prev = useRef(scope);
+  useEffect(() => {
+    if (address && session.address() && session.address() !== address.toLowerCase()) session.clear();
+    if (prev.current && prev.current !== scope) session.clear();
+    prev.current = scope;
+  }, [scope, address]);
+  return scope;
+}
+
 export function App() {
   const route = useRoute();
+  const scope = usePrivateScope();
   const parts = route.split("/").filter(Boolean);
   useEffect(() => { const t = document.querySelector("main h1")?.textContent; if (t) document.title = `${t} · IMD Sport Intelligence`; }, [route]);
   let page;
@@ -68,7 +93,7 @@ export function App() {
       <nav className="sports" aria-label="Sports">
         {SPORTS.map((s) => <a key={s.id} href={`#/sport/${s.id}`} aria-current={parts[1] === s.id ? "page" : undefined}>{s.name}</a>)}
       </nav>
-      <main id="main" tabIndex={-1}>{page}</main>
+      <main id="main" tabIndex={-1} key={scope}>{page}</main>
       <footer className="foot">
         <nav className="footnav" aria-label="More"><a href="#/accuracy">Accuracy report</a><a href="#/account">Prediction history and receipts</a><a href="#/activation">Status and activation</a></nav>
         <p>Sports analysis only. Nothing here is betting advice, a tip or a promise of winnings. Probabilities are estimates and are often wrong.</p>
@@ -155,20 +180,31 @@ function snapshotStatus(m: M): "final" | "scheduled" | "stale" {
   return Date.parse(m.kickoffUtc) > Date.now() ? "scheduled" : "stale";
 }
 
+const NOW = Date.now();
+const FUTURE = SNAP.filter((m) => !m.result && Date.parse(m.kickoffUtc) > NOW);
+const PAST_NO_RESULT = SNAP.filter((m) => !m.result && Date.parse(m.kickoffUtc) <= NOW);
+const SNAP_MONTH = new Date(epl.asOf).toLocaleDateString("en-GB", { month: "long", year: "numeric", timeZone: "UTC" });
+const DECIDED: Record<string, string> = { regulation: "Regulation", overtime: "Overtime", shootout: "Shootout", "extra-time": "After extra time", penalties: "On penalties", decision: "By decision", finish: "By finish" };
+const KIND: Record<FeedAvailability["kind"], string> = { "confirmed-injury": "Confirmed injury", withdrawal: "Withdrawal, no injury reported", suspension: "Suspension", questionable: "Questionable", "unknown-reason": "Out, reason not given", available: "Available" };
+const age = (s: number) => (s < 90 ? `${s} s old` : s < 5400 ? `${Math.round(s / 60)} min old` : `${Math.round(s / 3600)} h old`);
+const host = (u: string) => { try { return new URL(u).host; } catch { return u; } };
+
 function SportView({ id, tab }: { id: string; tab: string }) {
   const s = SPORTS.find((x) => x.id === id) ?? SPORTS[0];
   const { status } = useStatus();
+  const feed = useFeed(s.id);
   const tabs = [["live", "Live scores"], ["upcoming", "Upcoming"], ["availability", "Injuries and availability"], ["previews", "Prediction previews"], ["research", "Research"]] as const;
-  const feedOn = !!status?.feeds?.[s.id];
   const isFb = s.id === "football";
   const finals = SNAP.filter((m) => m.result).slice(-10).reverse();
-  const upcoming = SNAP.filter((m) => !m.result).slice(0, 12);
+  const ev = feed.data?.events ?? [];
+  const ok = feed.state === "ok";
+  const headLine = ok ? `Licensed feed via the companion, observed ${dt(feed.data!.observedUtc)}.` : isFb ? `Fixtures and results from a dated public snapshot (${asOf}); no live feed is active.` : feed.state === "loading" ? "Checking the companion's licensed feed…" : "No licensed live feed is active in this release.";
   return (
     <>
       <div className="sport-head">
         <div>
           <h1>{s.name}</h1>
-          <p className="muted">{s.league}. {isFb ? `Fixtures and results from a dated public snapshot (${asOf}); no live feed is active.` : "No licensed live feed is active in this release."}</p>
+          <p className="muted">{s.league}. {headLine}</p>
         </div>
         <SportArt sport={s.id} className="art head-art" />
       </div>
@@ -176,20 +212,28 @@ function SportView({ id, tab }: { id: string; tab: string }) {
         {tabs.map(([k, l]) => <a key={k} role="tab" aria-selected={tab === k} href={`#/sport/${s.id}/${k}`}>{l}</a>)}
       </div>
       <section className="panel" role="tabpanel">
-        {tab === "live" && (
+        {tab === "live" && (ok ? <FeedList title="Live and recent" rows={ev.filter((e) => e.status !== "scheduled")} empty="No live or recent events in the feed window." /> : (
           <>
-            <Unavailable what="Live scores" sport={s} on={feedOn} />
+            <Unavailable what="Live scores" sport={s} feed={feed} />
             {isFb && <><h2>Latest results in the snapshot</h2><p className="muted small">Final scores recorded in the archive as of {asOf}. These are historical, not live.</p><FixtureList rows={finals} /></>}
           </>
-        )}
-        {tab === "upcoming" && (isFb ? <><h2>Fixtures in the snapshot</h2><p className="muted small">Kick-off times converted to UTC. A fixture whose kick-off has passed without a result in the snapshot is marked stale: the snapshot predates it.</p><FixtureList rows={upcoming} /></> : <Unavailable what="Upcoming events" sport={s} on={feedOn} />)}
-        {tab === "availability" && (
+        ))}
+        {tab === "upcoming" && (ok ? <FeedList title="Upcoming" rows={ev.filter((e) => e.status === "scheduled")} empty="No scheduled events in the feed window." /> : isFb ? (
           <>
-            <Unavailable what="Injury and availability reports" sport={s} on={feedOn} />
-            <p className="muted small">When active, each report states its kind: a confirmed injury, a withdrawal (not treated as an injury unless a source says so), a suspension or a questionable status, each with its source and observation time.</p>
+            {feed.state !== "off" && <Unavailable what="Upcoming events" sport={s} feed={feed} />}
+            <h2>Scheduled in the {SNAP_MONTH} snapshot</h2>
+            <p className="muted small">Kick-off times in UTC from the archive as of {asOf}. Dates can move after the snapshot; check the club before travelling.</p>
+            <FixtureList rows={FUTURE.slice(0, 12)} />
+            {PAST_NO_RESULT.length > 0 && <><h3>Archive: kick-off passed, no result in the snapshot</h3><p className="muted small">{PAST_NO_RESULT.length} fixtures are marked stale because the snapshot predates their results. The most recent are shown.</p><FixtureList rows={PAST_NO_RESULT.slice(-6).reverse()} /></>}
           </>
-        )}
-        {tab === "previews" && (isFb ? <Previews rows={upcoming} /> : (
+        ) : <Unavailable what="Upcoming events" sport={s} feed={feed} />)}
+        {tab === "availability" && (ok && feed.data!.availability.status === "ok" ? <AvailabilityList feed={feed.data!} /> : (
+          <>
+            <Unavailable what="Injury and availability reports" sport={s} feed={feed} reason={feed.data?.availability.reason} />
+            <p className="muted small">When active, each report states its kind: a confirmed injury, a withdrawal with no injury reported, an absence with no reason given, a suspension or a questionable status, each with its source and observation time.</p>
+          </>
+        ))}
+        {tab === "previews" && (isFb ? <Previews rows={FUTURE.length ? FUTURE : PAST_NO_RESULT} /> : (
           <div className="empty"><h2>No validated model for {s.name} yet</h2><p className="muted">The only completed backtest is the EPL pilot, and it supports EPL claims only. {s.name} previews will appear after a backtest of the same kind and after research is activated.</p><a className="btn btn-blue" href="#/accuracy">See the EPL backtest</a></div>
         ))}
         {tab === "research" && <Research sport={s.id} status={status} />}
@@ -198,15 +242,53 @@ function SportView({ id, tab }: { id: string; tab: string }) {
   );
 }
 
-function Unavailable({ what, sport, on }: { what: string; sport: (typeof SPORTS)[number]; on: boolean }) {
+function Unavailable({ what, sport, feed, reason }: { what: string; sport: (typeof SPORTS)[number]; feed: ReturnType<typeof useFeed>; reason?: string }) {
+  const why = reason ?? feed.reason;
   return (
     <div className="unavail" role="status">
-      <Badge kind={on ? "live" : "unavailable"} />
+      <Badge kind="unavailable" />
       <div>
-        <strong>{what}: {on ? "served by the companion feed" : "unavailable"}</strong>
-        <p className="muted small">{on ? "Reading through the operator's licensed feed." : `Needs the operator's licensed feed (${sport.adapter}) behind the companion service. No unlicensed scraping is used.`}</p>
+        <strong>{what}: {feed.state === "loading" ? "checking the feed" : "unavailable"}</strong>
+        <p className="muted small">{feed.state === "off" ? `Needs the operator's licensed feed (${sport.adapter}) behind the companion service. No unlicensed scraping is used.` : feed.state === "loading" ? "Asking the companion service." : `The companion reports: ${why ?? "no data"}. Historical records stay marked historical.`}</p>
       </div>
     </div>
+  );
+}
+
+function FeedList({ title, rows, empty }: { title: string; rows: FeedEvent[]; empty: string }) {
+  return (
+    <>
+      <h2>{title}</h2>
+      {!rows.length ? <p className="muted">{empty}</p> : (
+        <ul className="feed">
+          {rows.map((e) => (
+            <li key={e.id}>
+              <div className="meta"><Badge kind={e.status} /><span>{e.competition}</span>{e.decidedIn && <span>{DECIDED[e.decidedIn] ?? e.decidedIn}</span>}<span>{e.outcomeModel === "three-way" ? "Draw possible" : "Two-way"}</span></div>
+              <span className="fx-teams">{e.home} <span className="num">{e.score ? e.score.join("–") : "v"}</span> {e.away}</span>
+              <span className="muted small">Starts {dt(e.startUtc)}. Observed {dt(e.observedUtc)}, {age(e.freshnessSeconds)}. {e.corroboratedBy.length ? `Corroborated by ${e.corroboratedBy.length} other source${e.corroboratedBy.length > 1 ? "s" : ""}.` : "Single source."}</span>
+              <span className="small">Source: {e.sources.map((u) => <a key={u} href={u}>{host(u)}</a>)} · <span className="mono">{e.id}</span></span>
+              {e.availability.length > 0 && <span className="small">{e.availability.map((a) => `${a.player}: ${KIND[a.kind]}`).join("; ")}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+function AvailabilityList({ feed }: { feed: FeedResponse }) {
+  const r = feed.availability.reports;
+  return (
+    <>
+      <h2>Injuries and availability</h2>
+      <p className="muted small">From {feed.availability.sources.map((u) => host(u)).join(", ")}, read {dt(feed.observedUtc)}. A withdrawal is not an injury unless the source names one.</p>
+      {!r.length ? <p className="muted">No reports in the feed right now.</p> : (
+        <div className="scroll-x"><table className="tbl">
+          <thead><tr><th scope="col">Player</th><th scope="col">Team</th><th scope="col">Kind</th><th scope="col">Source detail</th><th scope="col">Observed</th></tr></thead>
+          <tbody>{r.map((a) => <tr key={a.id}><th scope="row">{a.player}</th><td>{a.team}</td><td>{KIND[a.kind]}</td><td>{[a.status, a.detail].filter(Boolean).join(": ")} <a href={a.source}>{host(a.source)}</a></td><td className="num">{dt(a.observedUtc)}</td></tr>)}</tbody>
+        </table></div>
+      )}
+    </>
   );
 }
 
@@ -230,7 +312,7 @@ function FixtureList({ rows }: { rows: M[] }) {
 function Previews({ rows }: { rows: M[] }) {
   return (
     <>
-      <h2>Model previews from the snapshot</h2>
+      <h2>{rows === FUTURE ? `Previews for fixtures scheduled in the ${SNAP_MONTH} snapshot` : "Model previews from the snapshot"}</h2>
       <p className="muted small">Free, historical-model previews: three outcomes, draws included, from Elo ratings frozen at {asOf}. They are not updated with later results, injuries or news, and stale fixtures stay marked stale.</p>
       <div className="previews">
         {rows.slice(0, 6).map((m) => (
@@ -299,7 +381,7 @@ function MatchPage({ id }: { id: string }) {
       </section>
       <section className="card">
         <h2>Premium synthesis</h2>
-        <Checkout version={m.id} />
+        <Checkout eventId={m.id} home={team(m.home)} away={team(m.away)} />
       </section>
       <section className="card">
         <h2>Source</h2>
@@ -314,50 +396,117 @@ function MatchPage({ id }: { id: string }) {
   );
 }
 
-function Checkout({ version }: { version: string }) {
-  const { status, tried } = useStatus();
+type Version = { version: string; modelVersion: string; baseModel: string; cutoffUtc: string; outcomes: string[]; releasedAt: number; purchasable: boolean; entitled: boolean; intent: { id: string; status: string } | null };
+type Intent = { id: string; legs: Record<"developer" | "research", { recipient: string; txHash?: string; verifiedAt?: number }> };
+type Call = { to: string; data: string; leg: string };
+type Synthesis = { release: { version: string; cutoffUtc: string; outcomes: string[]; probabilities: number[]; confidence: string; reasons: string[]; counterarguments: string[]; dataGaps: string[]; calibration: { temperature: number; n: number }; evidence: unknown[] } };
+const LEG_NAME = { developer: "Developer", research: "Swarm research" } as const;
+
+function SynthesisView({ s, home, away }: { s: Synthesis; home: string; away: string }) {
+  const r = s.release;
+  const labels = r.outcomes.length === 3 ? [`${home} win`, "Draw", `${away} win`] : [`${home} win`, `${away} win`];
+  return (
+    <div className="synth">
+      <p className="ok-note" role="status">You own this prediction version. Reopening it never charges again. <a href="#/account">See your receipts</a></p>
+      <ProbBar p={r.probabilities} labels={labels} />
+      <dl className="facts">
+        <div><dt>Confidence</dt><dd>{r.confidence}</dd></div>
+        <div><dt>Evidence cutoff</dt><dd>{dt(r.cutoffUtc)}</dd></div>
+        <div><dt>Calibration</dt><dd className="num">Temperature {r.calibration.temperature} fitted on {r.calibration.n} earlier forecasts</dd></div>
+        <div><dt>Accepted Swarm work</dt><dd className="num">{r.evidence.length} records</dd></div>
+      </dl>
+      {r.reasons.length > 0 && <><h3>Reasons</h3><ul className="plain">{r.reasons.map((x) => <li key={x}>{x}</li>)}</ul></>}
+      {r.counterarguments.length > 0 && <><h3>Counterarguments</h3><ul className="plain">{r.counterarguments.map((x) => <li key={x}>{x}</li>)}</ul></>}
+      {r.dataGaps.length > 0 && <><h3>Data gaps</h3><ul className="plain">{r.dataGaps.map((x) => <li key={x}>{x}</li>)}</ul></>}
+    </div>
+  );
+}
+
+/**
+ * Premium synthesis for one event. The companion lists the event's released versions; checkout
+ * appears only for a purchasable completed version while the companion reports every prerequisite.
+ */
+function Checkout({ eventId, home = "Home", away = "Away" }: { eventId: string; home?: string; away?: string }) {
   const { address, isConnected } = useAccount();
-  const [step, setStep] = useState(""); const [err, setErr] = useState("");
-  const [intent, setIntent] = useState<{ id: string; calls: { to: string; data: string; leg: string }[]; legs: Record<string, { recipient: string; txHash?: string }> } | null>(null);
-  const [owned, setOwned] = useState(false);
-  if (!COMPANION_ORIGIN || (tried && !status)) return (
+  const [list, setList] = useState<{ state: "loading" | "ok" | "error"; versions: Version[]; checkout?: { enabled: boolean; blockers: string[] } }>({ state: "loading", versions: [] });
+  const [step, setStep] = useState(""); const [err, setErr] = useState(""); const [busy, setBusy] = useState(false);
+  const [active, setActive] = useState<{ version: string; intent: Intent; calls: Call[]; waiting: string[] } | null>(null);
+  const [owned, setOwned] = useState<Synthesis | null>(null);
+  const loadList = async () => {
+    const r = await api<{ versions: Version[]; checkout: { enabled: boolean; blockers: string[] } }>(`/api/events/${encodeURIComponent(eventId)}/predictions`);
+    if (!r.ok) return setList({ state: "error", versions: [] });
+    setList({ state: "ok", versions: r.data.versions, checkout: r.data.checkout });
+    const ent = r.data.versions.find((v) => v.entitled); if (ent) await openSynthesis(ent.version);
+  };
+  const openSynthesis = async (version: string) => {
+    const r = await api<Synthesis>(`/api/predictions/${encodeURIComponent(version)}`);
+    if (r.ok) { setOwned(r.data); setActive(null); setStep(""); } else setErr(r.status === 402 ? "The companion has not granted this version yet." : "The companion did not return the synthesis.");
+  };
+  /** Ask the companion for the bound intent (idempotent) and draw the next confirmation from its unpaid, not-pending legs. */
+  const refresh = async (version: string) => {
+    const res = await api<any>("/api/intents", { method: "POST", body: JSON.stringify({ predictionVersion: version }) });
+    if (!res.ok) { setErr(res.data?.blockers?.join("; ") ?? res.data?.error ?? "This prediction version is not purchasable."); return null; }
+    if (res.data.alreadyEntitled) { await openSynthesis(version); return null; }
+    const intent = res.data.intent as Intent;
+    const before = Object.keys(pendingHashes.get(intent.id)).length;
+    const rec = await reconcilePending(intent.id);
+    if (rec.errors.length) setErr(rec.errors.join("; "));
+    if (rec.entitled) { await openSynthesis(version); return null; }
+    if (rec.waiting.length < before) return refresh(version); // a leg settled: re-read the bound intent before drawing the next confirmation
+    const calls = (res.data.calls as Call[]).filter((c) => !rec.waiting.includes(c.leg));
+    const next = { version, intent, calls, waiting: rec.waiting };
+    setActive(next); return next;
+  };
+  useEffect(() => { if (COMPANION_ORIGIN) loadList(); }, [eventId]);
+  // Reopening a version with an open intent resumes it: pending hashes are re-verified before anything is asked.
+  useEffect(() => { const v = list.versions.find((x) => x.intent && !x.entitled); if (v && session.get() && !active && !owned) refresh(v.version); }, [list.versions]);
+
+  if (!COMPANION_ORIGIN) return (
     <div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>Purchases are off in this release.</strong><p className="muted small">A premium synthesis costs 1 IMD per prediction version once the operator activates the companion service. No payment is requested here. <a href="#/activation">What needs activation</a></p></div></div>
   );
-  if (!status) return <p className="muted">Checking the companion service…</p>;
-  if (!status.checkout.enabled || !status.checkout.recipients) return (
-    <div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>Purchases are paused.</strong><p className="muted small">The companion reports: {status.checkout.blockers.join("; ")}.</p></div></div>
-  );
-  const r = status.checkout.recipients;
-  const start = async () => {
-    setErr("");
+  if (owned) return <SynthesisView s={owned} home={home} away={away} />;
+  if (list.state === "loading") return <p className="muted">Checking the companion service…</p>;
+  if (list.state === "error") return <div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>Purchases are unavailable.</strong><p className="muted small">The companion service did not answer. No payment is requested.</p></div></div>;
+  const buyable = list.versions.filter((v) => v.purchasable);
+  if (!buyable.length) return <div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>No completed prediction version for this event.</strong><p className="muted small">A version is released after Swarm research, independent challenges and adjudication finish. No payment is requested.</p></div></div>;
+  if (!list.checkout?.enabled) return <div className="unavail" role="status"><Badge kind="unavailable" /><div><strong>Purchases are paused.</strong><p className="muted small">The companion reports: {list.checkout?.blockers.join("; ")}.</p></div></div>;
+  const run = (f: () => Promise<void>) => async () => { setErr(""); setBusy(true); try { await f(); } catch (e) { setErr((e as Error).message.split("\n")[0]); setStep(""); } finally { setBusy(false); } };
+  const start = (version: string) => run(async () => {
     if (!address) return;
-    if (!session.get()) { const e = await signIn(address); if (e) return setErr(e); }
-    const res = await api<any>("/api/intents", { method: "POST", body: JSON.stringify({ predictionVersion: version }) });
-    if (!res.ok) return setErr(res.data?.blockers?.join("; ") ?? res.data?.error ?? "This prediction is not purchasable.");
-    if (res.data.alreadyEntitled) { setOwned(true); return; }
-    setIntent({ id: res.data.intent.id, calls: res.data.calls, legs: res.data.intent.legs });
-  };
-  const pay = async () => {
-    if (!intent || !address) return;
-    try {
-      const out = await payLegs(intent.id, address, intent.calls, setStep);
-      if (out.some((o) => o.data.entitled)) { setOwned(true); setStep(""); } else setStep("One leg verified. Reopen this prediction to pay the missing half.");
-    } catch (e) { setErr((e as Error).message.split("\n")[0]); setStep(""); }
-  };
-  if (owned) return <p className="ok-note" role="status">You own this prediction version. Reopening it never charges again. <a href="#/account">See your receipts</a></p>;
-  if (!isConnected) return <p className="muted">Connect a wallet and sign in to buy this prediction version for 1 IMD.</p>;
-  if (!intent) return <><p>1 IMD for this prediction version, paid as two direct transfers from your wallet.</p><button className="btn btn-gold" onClick={start}>Review the purchase</button>{err && <p className="note" role="alert">{err}</p>}</>;
+    if (!session.get()) { const e = await signIn(address); if (e) { setErr(e); return; } }
+    await refresh(version);
+  });
+  const pay = run(async () => {
+    if (!active || !address) return;
+    try { await payLegs(active.intent.id, address, active.calls, setStep); }
+    finally { const n = await refresh(active.version); setStep(n && n.waiting.length ? "Sent. Waiting for Ethereum finality before the transfer is verified; you will not be asked for it again." : ""); }
+  });
+  if (!isConnected) return <p className="muted">Connect a wallet and sign in to buy a prediction version for 1 IMD.</p>;
+  if (!active) return (
+    <>
+      <ul className="plain">{buyable.map((v) => (
+        <li key={v.version}>
+          <p>Version <span className="mono wrap">{v.version}</span>, evidence cutoff {dt(v.cutoffUtc)}. 1 IMD, paid as two direct transfers from your wallet.</p>
+          <button className="btn btn-gold" onClick={start(v.version)} disabled={busy}>{v.intent ? "Resume the purchase" : "Review the purchase"}</button>
+        </li>
+      ))}</ul>
+      {err && <p className="note" role="alert">{err}</p>}
+    </>
+  );
+  const legs = active.intent.legs;
+  const state = (k: "developer" | "research") => legs[k].verifiedAt ? "Verified" : active.waiting.includes(k) ? "Sent, waiting for finality" : "To pay";
   return (
     <>
+      <p className="small">Version <span className="mono wrap">{active.version}</span></p>
       <table className="tbl">
         <thead><tr><th scope="col">Leg</th><th scope="col">Recipient</th><th scope="col">Amount</th><th scope="col">State</th></tr></thead>
-        <tbody>
-          <tr><th scope="row">Developer</th><td className="mono wrap">{r.developer}</td><td className="num">0.5 IMD</td><td>{intent.legs.developer.txHash ? "Verified" : "To pay"}</td></tr>
-          <tr><th scope="row">Swarm research</th><td className="mono wrap">{r.research}</td><td className="num">0.5 IMD</td><td>{intent.legs.research.txHash ? "Verified" : "To pay"}</td></tr>
-        </tbody>
+        <tbody>{(["developer", "research"] as const).map((k) => (
+          <tr key={k}><th scope="row">{LEG_NAME[k]}</th><td className="mono wrap">{legs[k].recipient}</td><td className="num">0.5 IMD</td><td>{state(k)}{legs[k].txHash && <> · <a href={`https://etherscan.io/tx/${legs[k].txHash}`}>receipt</a></>}</td></tr>
+        ))}</tbody>
       </table>
-      <p className="muted small">Token: IMD on Ethereum Mainnet, <span className="mono wrap">{TOKEN.address}</span>. Network gas is paid separately to the network and is not part of the 1 IMD. If your wallet supports atomic batches you confirm once; otherwise you confirm two transfers, and if you stop after the first, the verified half is kept and you resume at the missing one.</p>
-      <button className="btn btn-gold" onClick={pay} disabled={!!step && !step.startsWith("One leg")}>Pay {intent.calls.length === 2 ? "1 IMD" : "the missing 0.5 IMD"}</button>
+      <p className="muted small">Token: IMD on Ethereum Mainnet, <span className="mono wrap">{TOKEN.address}</span>. Network gas is paid separately to the network and is not part of the 1 IMD. If your wallet supports atomic batches you confirm once; otherwise you confirm two transfers, and if you stop after the first, the sent half is kept and you resume at the missing one.</p>
+      {active.calls.length > 0 && <button className="btn btn-gold" onClick={pay} disabled={busy}>Pay {active.calls.length === 2 ? "1 IMD" : "the missing 0.5 IMD"}</button>}
+      {active.waiting.length > 0 && <button className="btn btn-quiet" onClick={run(async () => { await refresh(active.version); })} disabled={busy}>Check the sent transfer again</button>}
       {step && <p className="muted" role="status">{step}</p>}
       {err && <p className="note" role="alert">{err}</p>}
     </>
@@ -409,7 +558,7 @@ function Accuracy() {
       <section>
         <h2>How it was run</h2>
         <ol className="steps">
-          <li><strong>Training, {epl.splits.training.seasons.join(" and ")}:</strong> {epl.splits.training.matches} matches fit the Elo update size (K {epl.model.params.K}), home advantage ({epl.model.params.HFA}), scale ({epl.model.params.S}) and draw band ({epl.model.params.theta}).</li>
+          <li><strong>Training, {epl.splits.training.seasons.map((x) => x.replace("-", "/")).join(" and ")}:</strong> Elo ratings used all {epl.splits.training.matches} training results. Parameter selection scored {epl.splits.training.parameterSelection.matches}, excluding {epl.splits.training.parameterSelection.warmupRule.replace("1-8", "1–8").replace("2022-23", "2022/23")} ({epl.splits.training.parameterSelection.warmupExcluded} matches). Selected: update size K {epl.model.params.K}, home advantage {epl.model.params.HFA}, scale {epl.model.params.S}, draw band {epl.model.params.theta}.</li>
           <li><strong>Calibration, {epl.splits.calibration.seasons[0]}:</strong> {epl.splits.calibration.matches} later matches fit one temperature ({epl.model.temperature}) that softens over-confident splits.</li>
           <li><strong>Held-out evaluation, {epl.splits.heldOut.seasons[0]}:</strong> {epl.splits.heldOut.matches} matches scored once. Every probability used only results before its kick-off.</li>
           <li><strong>Baseline:</strong> home {pct(epl.baseline.p[0])}, draw {pct(epl.baseline.p[1])}, away {pct(epl.baseline.p[2])}, the outcome frequencies of the training and calibration seasons.</li>
@@ -458,7 +607,7 @@ function Account() {
   const { address, isConnected } = useAccount();
   const [hist, setHist] = useState<any>(null); const [err, setErr] = useState("");
   const load = async () => { const r = await api<any>("/api/me/history"); if (r.ok) setHist(r.data); else setErr(r.status === 401 ? "Sign in to see your history." : "The companion service did not answer."); };
-  useEffect(() => { if (COMPANION_ORIGIN && session.get()) load(); }, []);
+  useEffect(() => { if (COMPANION_ORIGIN && address && session.get() && session.address() === address.toLowerCase()) load(); }, [address]);
   return (
     <>
       <h1>Your predictions and receipts</h1>

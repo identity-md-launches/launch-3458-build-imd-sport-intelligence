@@ -49,3 +49,20 @@ test("HTTP: signed-out access, CORS origin lock, feeds unavailable without keys,
     srv.close();
   }
 });
+test("HTTP: event prediction versions list state without synthesis; feeds route returns adapter data", async () => {
+  const s = store(); const V = "openfootball:en.1:2025-26:2026-05-24:manchester-city-v-aston-villa@imd-sport-synth-1@2026-05-24T14:00:00Z";
+  s.db.premium[V] = { eventId: "openfootball:en.1:2025-26:2026-05-24:manchester-city-v-aston-villa", releasedAt: 1, purchasable: true, release: { modelVersion: "imd-sport-synth-1", baseModel: "epl-elo-olog-1", cutoffUtc: "2026-05-24T14:00:00Z", outcomes: ["home", "draw", "away"], probabilities: [0.5, 0.3, 0.2] }, findings: [{ findings: "premium text" }] };
+  const feed = { name: "fx", needsKey: true, sports: ["nhl"], fetchEvents: async () => [{ id: "fx:nhl:1", sport: "nhl", competition: "NHL", startUtc: "2026-11-26T00:00:00Z", home: "H", away: "A", status: "live", score: [1, 0], decidedIn: null, outcomeModel: "two-way", observedUtc: new Date().toISOString(), sources: ["https://fx.example"], freshnessSeconds: 3, corroboratedBy: [], availability: [] }], fetchAvailability: async () => ({ status: "ok", reports: [], sources: [] }) } as any;
+  const srv = createServer(handler({ cfg: cfg(), store: s, reader: fixtureChain(), feeds: [feed], tokenVerified: async () => true }));
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+  const base = `http://127.0.0.1:${(srv.address() as any).port}`;
+  const r = await (await fetch(base + "/api/events/" + encodeURIComponent("openfootball:en.1:2025-26:2026-05-24:manchester-city-v-aston-villa") + "/predictions", { headers: { origin: ORIGIN } })).json();
+  assert.equal(r.versions.length, 1); assert.equal(r.versions[0].version, V); assert.equal(r.versions[0].entitled, false); assert.equal(r.checkout.enabled, true);
+  assert.ok(!JSON.stringify(r).includes("premium text") && !JSON.stringify(r).includes("probabilities"));
+  assert.equal((await fetch(base + "/api/predictions/" + encodeURIComponent(V), { headers: { origin: ORIGIN } })).status, 402);
+  const st = await (await fetch(base + "/api/status", { headers: { origin: ORIGIN } })).json();
+  assert.equal(st.feeds.nhl, true);
+  const f = await (await fetch(base + "/api/feeds/nhl", { headers: { origin: ORIGIN } })).json();
+  assert.equal(f.status, "ok"); assert.equal(f.events[0].status, "live");
+  srv.close();
+});

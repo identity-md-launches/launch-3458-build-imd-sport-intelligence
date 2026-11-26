@@ -17,7 +17,7 @@ export function transferCalldata(to: string, amount: bigint = LEG_UNITS): string
 export type Purchasable = (predictionVersion: string) => boolean;
 
 export async function verifierHealthy(reader: ChainReader, cfg: OperatorConfig): Promise<boolean> {
-  try { return (await reader.chainId()) === cfg.chainId && (await reader.blockNumber()) > 0; } catch { return false; }
+  try { return (await reader.chainId()) === cfg.chainId && (await reader.blockNumber()) > 0 && (await reader.finalizedBlock()) > 0; } catch { return false; }
 }
 
 export type IntentResult =
@@ -45,7 +45,7 @@ export async function openIntent(store: Store, cfg: OperatorConfig, reader: Chai
   return { ok: true, alreadyEntitled: false, intent, calls };
 }
 
-export type LegResult = { ok: boolean; error?: string; verified: string[]; intent?: Intent; entitled?: boolean };
+export type LegResult = { ok: boolean; error?: string; verified: string[]; intent?: Intent; entitled?: boolean; pending?: boolean; finalizedBlock?: number; receiptBlock?: number };
 
 /**
  * Verify a buyer's transaction against an intent. Accepts a single transfer, or a batch whose
@@ -59,14 +59,18 @@ export async function submitLeg(store: Store, cfg: OperatorConfig, reader: Chain
   if (!hasLeg && intent.expiresAt < now) { store.tx(() => { intent.status = "expired"; }); return { ok: false, error: "intent_expired", verified: [] }; }
   if ((await reader.chainId()) !== intent.chainId) return { ok: false, error: "wrong_chain", verified: [] };
   const rc = await reader.receipt(txHash);
-  if (!rc) return { ok: false, error: "receipt_not_found", verified: [] };
+  if (!rc) return { ok: false, error: "receipt_not_found", verified: [], pending: true };
   if (rc.status !== "0x1") return { ok: false, error: "transaction_failed", verified: [] };
   const block = Number(rc.blockNumber);
   const tokenLogs = rc.logs.filter((l) => !l.removed && lc(l.address) === intent.token && lc(l.topics[0] ?? "") === TRANSFER_TOPIC);
   if (tokenLogs.length && tokenLogs.every((l) => store.db.reservations[`${intent.chainId}:${lc(txHash)}:${Number(l.logIndex)}`])) return { ok: false, error: "duplicate_receipt", verified: [] };
   if (block < intent.createdBlock) return { ok: false, error: "before_intent", verified: [] };
-  const head = await reader.blockNumber();
-  if (head - block + 1 < cfg.confirmations) return { ok: false, error: "not_final", verified: [] };
+  // Finality is the chain's own finalized checkpoint, not a confirmation count. A receipt above it
+  // stays pending; a receipt whose block is no longer canonical is not counted at all.
+  const finalized = await reader.finalizedBlock();
+  if (!(finalized > 0) || block > finalized) return { ok: false, error: "not_final", verified: [], pending: true, finalizedBlock: finalized, receiptBlock: block };
+  const canonical = await reader.blockHash(block);
+  if (!canonical || lc(canonical) !== lc(rc.blockHash ?? "")) return { ok: false, error: "receipt_not_canonical", verified: [], pending: true };
   const verified: string[] = [];
   let sawReserved = false;
   store.tx((db) => {

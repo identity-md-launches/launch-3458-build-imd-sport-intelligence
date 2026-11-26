@@ -15,7 +15,10 @@ export type Db = {
   research: Record<string, unknown>;
   ledger: { kind: "allocation" | "authorized-spend" | "spent"; amountUnits: string; ref: string; at: number }[];
   premium: Record<string, unknown>;
+  /** Swarm spend reservations keyed by the idempotent order key (also the IMD requestKey). */
+  swarmOrders: Record<string, SwarmOrder>;
 };
+export type SwarmOrder = { key: string; roleId: string; eventId: string; amountUnits: string; state: "reserved" | "spent" | "released"; orderId?: string; createdAt: number; updatedAt: number; note?: string };
 export type Leg = { recipient: string; amountUnits: string; txHash?: string; logIndex?: number; blockNumber?: number; verifiedAt?: number };
 export type Intent = {
   id: string; payer: string; predictionVersion: string; token: string; chainId: number;
@@ -24,7 +27,7 @@ export type Intent = {
   status: "open" | "partial" | "paid" | "expired";
 };
 
-const empty = (): Db => ({ nonces: {}, sessions: {}, intents: {}, reservations: {}, entitlements: {}, research: {}, ledger: [], premium: {} });
+const empty = (): Db => ({ nonces: {}, sessions: {}, intents: {}, reservations: {}, entitlements: {}, research: {}, ledger: [], premium: {}, swarmOrders: {} });
 
 export class Store {
   db: Db;
